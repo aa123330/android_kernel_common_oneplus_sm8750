@@ -678,6 +678,9 @@ struct lruvec {
 #ifdef CONFIG_MEMCG
 	struct pglist_data *pgdat;
 #endif
+#ifndef __GENKSYMS__
+	struct zswap_lruvec_state zswap_lruvec_state;
+#endif
 };
 
 /* Isolate for asynchronous migration */
