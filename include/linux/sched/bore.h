@@ -7,14 +7,13 @@
 #define SCHED_BORE_AUTHOR   "Masahito Suzuki"
 #define SCHED_BORE_PROGNAME "BORE CPU Scheduler modification"
 
-#define SCHED_BORE_VERSION  "6.2.2"
+#define SCHED_BORE_VERSION  "6.2.3"
 
 #ifdef CONFIG_SCHED_BORE
 extern u8   __read_mostly sched_bore;
 extern u8   __read_mostly sched_burst_exclude_kthreads;
 extern u8   __read_mostly sched_burst_smoothness;
 extern u8   __read_mostly sched_burst_fork_atavistic;
-extern u8   __read_mostly sched_burst_parity_threshold;
 extern u8   __read_mostly sched_burst_penalty_offset;
 extern u8   __read_mostly sched_burst_futex_boost;
 extern uint __read_mostly sched_burst_penalty_scale;
