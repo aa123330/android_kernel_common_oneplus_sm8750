@@ -106,6 +106,11 @@ struct irq_desc {
 #ifdef CONFIG_HARDIRQS_SW_RESEND
 	struct hlist_node	resend_node;
 #endif
+#ifdef CONFIG_IRQ_SBALANCE
+#ifndef __GENKSYMS__
+	unsigned int		last_cpu;
+#endif
+#endif
 	ANDROID_VENDOR_DATA(1);
 } ____cacheline_internodealigned_in_smp;
 

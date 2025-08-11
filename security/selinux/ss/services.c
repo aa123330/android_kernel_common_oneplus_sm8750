@@ -958,7 +958,10 @@ void services_compute_xperms_decision(struct extended_perms_decision *xpermd,
 					xpermd->driver))
 			return;
 	} else {
-		BUG();
+		pr_warn_once(
+			"SELinux: unknown extended permission (%u) will be ignored\n",
+			node->datum.u.xperms->specified);
+		return;
 	}
 
 	if (node->key.specified == AVTAB_XPERMS_ALLOWED) {
@@ -995,7 +998,8 @@ void services_compute_xperms_decision(struct extended_perms_decision *xpermd,
 					node->datum.u.xperms->perms.p[i];
 		}
 	} else {
-		BUG();
+		pr_warn_once("SELinux: unknown specified key (%u)\n",
+			     node->key.specified);
 	}
 }
 
@@ -1499,6 +1503,8 @@ static int security_context_to_sid_core(const char *scontext, u32 scontext_len,
 	struct selinux_policy *policy;
 	struct policydb *policydb;
 	struct sidtab *sidtab;
+	char scontext2_onstack[SZ_128] __aligned(sizeof(long));
+	char str_onstack[SZ_128] __aligned(sizeof(long));
 	char *scontext2, *str = NULL;
 	struct context context;
 	int rc = 0;
@@ -1508,9 +1514,15 @@ static int security_context_to_sid_core(const char *scontext, u32 scontext_len,
 		return -EINVAL;
 
 	/* Copy the string to allow changes and ensure a NUL terminator */
-	scontext2 = kmemdup_nul(scontext, scontext_len, gfp_flags);
-	if (!scontext2)
-		return -ENOMEM;
+	if (scontext_len < sizeof(scontext2_onstack)) {
+		scontext2 = scontext2_onstack;
+		memcpy(scontext2, scontext, scontext_len);
+		scontext2[scontext_len] = '\0';
+	} else {
+		scontext2 = kmemdup_nul(scontext, scontext_len, gfp_flags);
+		if (!scontext2)
+			return -ENOMEM;
+	}
 
 	if (!selinux_initialized()) {
 		u32 i;
@@ -1530,10 +1542,16 @@ static int security_context_to_sid_core(const char *scontext, u32 scontext_len,
 
 	if (force) {
 		/* Save another copy for storing in uninterpreted form */
-		rc = -ENOMEM;
-		str = kstrdup(scontext2, gfp_flags);
-		if (!str)
-			goto out;
+		if (scontext2 == scontext2_onstack) {
+			str = str_onstack;
+			memcpy(str, scontext2, scontext_len + 1);
+		} else {
+			str = kstrdup(scontext2, gfp_flags);
+			if (!str) {
+				rc = -ENOMEM;
+				goto out;
+			}
+		}
 	}
 retry:
 	rcu_read_lock();
@@ -1544,11 +1562,15 @@ retry:
 				      &context, def_sid);
 	if (rc == -EINVAL && force) {
 		context.str = str;
-		context.len = strlen(str) + 1;
+		context.len = scontext_len + 1;
 		str = NULL;
 	} else if (rc)
 		goto out_unlock;
 	rc = sidtab_context_to_sid(sidtab, &context, sid);
+
+	if (context.str == str_onstack)
+		context.str = NULL;
+
 	if (rc == -ESTALE) {
 		rcu_read_unlock();
 		if (context.str) {
@@ -1562,8 +1584,10 @@ retry:
 out_unlock:
 	rcu_read_unlock();
 out:
-	kfree(scontext2);
-	kfree(str);
+	if (scontext2 != scontext2_onstack) {
+		kfree(scontext2);
+		kfree(str);
+	}
 	return rc;
 }
 
@@ -3504,7 +3528,8 @@ void selinux_audit_rule_free(void *vrule)
 	}
 }
 
-int selinux_audit_rule_init(u32 field, u32 op, char *rulestr, void **vrule)
+int selinux_audit_rule_init(u32 field, u32 op, char *rulestr, void **vrule,
+			    gfp_t gfp)
 {
 	struct selinux_state *state = &selinux_state;
 	struct selinux_policy *policy;
@@ -3545,7 +3570,7 @@ int selinux_audit_rule_init(u32 field, u32 op, char *rulestr, void **vrule)
 		return -EINVAL;
 	}
 
-	tmprule = kzalloc(sizeof(struct selinux_audit_rule), GFP_KERNEL);
+	tmprule = kzalloc(sizeof(struct selinux_audit_rule), gfp);
 	if (!tmprule)
 		return -ENOMEM;
 	context_init(&tmprule->au_ctxt);

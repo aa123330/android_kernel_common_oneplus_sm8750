@@ -1,5 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0+ OR BSD-3-Clause
 /*
- * Copyright (c) Yann Collet, Facebook, Inc.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
  *
  * This source code is licensed under both the BSD-style license (found in the
@@ -18,7 +19,9 @@
 
 #define ZSTD_MAX_CLEVEL     22
 
+#ifdef __GNUC__
 __attribute__((__unused__))
+#endif
 
 static const ZSTD_compressionParameters ZSTD_defaultCParameters[4][ZSTD_MAX_CLEVEL+1] = {
 {   /* "default" - for any srcSize > 256 KB */

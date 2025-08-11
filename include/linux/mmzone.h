@@ -23,6 +23,7 @@
 #include <linux/page-flags.h>
 #include <linux/local_lock.h>
 #include <linux/android_kabi.h>
+#include <linux/kcompress.h>
 #include <asm/page.h>
 
 /* Free memory management - zoned buddy allocator.  */
@@ -36,6 +37,22 @@
 #define IS_MAX_ORDER_ALIGNED(pfn) IS_ALIGNED(pfn, MAX_ORDER_NR_PAGES)
 
 #define NR_PAGE_ORDERS (MAX_ORDER + 1)
+
+/* Defines the order for the number of pages that have a migrate type. */
+#ifndef CONFIG_PAGE_BLOCK_ORDER
+#define PAGE_BLOCK_ORDER MAX_ORDER
+#else
+#define PAGE_BLOCK_ORDER CONFIG_PAGE_BLOCK_ORDER
+#endif /* CONFIG_PAGE_BLOCK_ORDER */
+
+/*
+ * The MAX_ORDER, which defines the max order of pages to be allocated
+ * by the buddy allocator, has to be larger or equal to the PAGE_BLOCK_ORDER,
+ * which defines the order for the number of pages that can have a migrate type
+ */
+#if (PAGE_BLOCK_ORDER > MAX_ORDER)
+#error MAX_ORDER must be >= PAGE_BLOCK_ORDER
+#endif
 
 /*
  * PAGE_ALLOC_COSTLY_ORDER is the order at which allocations are deemed
@@ -156,6 +173,11 @@ enum zone_stat_item {
 	NR_FREE_CMA_PAGES,
 #ifdef CONFIG_UNACCEPTED_MEMORY
 	NR_UNACCEPTED,
+#endif
+#ifdef CONFIG_UKSM
+#ifndef __GENKSYMS__
+	NR_UKSM_ZERO_PAGES,
+#endif
 #endif
 	NR_VM_ZONE_STAT_ITEMS };
 
@@ -658,8 +680,6 @@ struct lruvec {
 #endif
 };
 
-/* Isolate unmapped pages */
-#define ISOLATE_UNMAPPED	((__force isolate_mode_t)0x2)
 /* Isolate for asynchronous migration */
 #define ISOLATE_ASYNC_MIGRATE	((__force isolate_mode_t)0x4)
 /* Isolate unevictable pages */
@@ -689,6 +709,9 @@ enum zone_watermarks {
 #endif
 #define NR_LOWORDER_PCP_LISTS (MIGRATE_PCPTYPES * (PAGE_ALLOC_COSTLY_ORDER + 1))
 #define NR_PCP_LISTS (NR_LOWORDER_PCP_LISTS + NR_PCP_THP)
+
+void all_pcp_disable(void);
+void all_pcp_enable(void);
 
 #define min_wmark_pages(z) (z->_watermark[WMARK_MIN] + z->watermark_boost)
 #define low_wmark_pages(z) (z->_watermark[WMARK_LOW] + z->watermark_boost)
@@ -1435,7 +1458,7 @@ typedef struct pglist_data {
 	struct memory_failure_stats mf_stats;
 #endif
 
-	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_USE(1, struct kcompress_data *kcompress);
 } pg_data_t;
 
 #define node_present_pages(nid)	(NODE_DATA(nid)->node_present_pages)
@@ -2028,8 +2051,9 @@ static inline int subsection_map_index(unsigned long pfn)
 static inline int pfn_section_valid(struct mem_section *ms, unsigned long pfn)
 {
 	int idx = subsection_map_index(pfn);
+	struct mem_section_usage *usage = READ_ONCE(ms->usage);
 
-	return test_bit(idx, READ_ONCE(ms->usage)->subsection_map);
+	return usage ? test_bit(idx, usage->subsection_map) : 0;
 }
 #else
 static inline int pfn_section_valid(struct mem_section *ms, unsigned long pfn)

@@ -61,6 +61,10 @@
 
 EXPORT_TRACEPOINT_SYMBOL_GPL(sched_stat_runtime);
 
+#ifdef CONFIG_SCHED_BORE
+#include <linux/sched/bore.h>
+#endif // CONFIG_SCHED_BORE
+
 /*
  * Targeted preemption latency for CPU-bound tasks:
  *
@@ -86,18 +90,31 @@ EXPORT_SYMBOL_GPL(sysctl_sched_latency);
  *   SCHED_TUNABLESCALING_LOG - scaled logarithmical, *1+ilog(ncpus)
  *   SCHED_TUNABLESCALING_LINEAR - scaled linear, *ncpus
  *
- * (default SCHED_TUNABLESCALING_LOG = *(1+ilog(ncpus))
+ * BORE : default SCHED_TUNABLESCALING_NONE = *1 constant
+ * EEVDF: default SCHED_TUNABLESCALING_LOG  = *(1+ilog(ncpus))
  */
+#ifdef CONFIG_SCHED_BORE
+unsigned int sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_NONE;
+#else // !CONFIG_SCHED_BORE
 unsigned int sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_LOG;
+#endif // CONFIG_SCHED_BORE
 
 /*
  * Minimal preemption granularity for CPU-bound tasks:
  *
- * (default: 0.75 msec * (1 + ilog(ncpus)), units: nanoseconds)
+ * BORE : base_slice = minimum multiple of nsecs_per_tick >= min_base_slice
+ * (default min_base_slice = 2000000 constant, units: nanoseconds)
+ * EEVDF: default 0.75 msec * (1 + ilog(ncpus)), units: nanoseconds
  */
-unsigned int sysctl_sched_base_slice			= 750000ULL;
+#ifdef CONFIG_SCHED_BORE
+static const unsigned int nsecs_per_tick       = 1000000000ULL / HZ;
+unsigned int sysctl_sched_min_base_slice       = CONFIG_MIN_BASE_SLICE_NS;
+__read_mostly uint sysctl_sched_base_slice     = nsecs_per_tick;
+#else // !CONFIG_SCHED_BORE
+unsigned int sysctl_sched_base_slice			= 700000ULL;
+static unsigned int normalized_sysctl_sched_base_slice	= 700000ULL;
+#endif // CONFIG_SCHED_BORE
 EXPORT_SYMBOL_GPL(sysctl_sched_base_slice);
-static unsigned int normalized_sysctl_sched_base_slice	= 750000ULL;
 
 /*
  * After fork, child runs first. If set to 0 (default) then
@@ -231,6 +248,13 @@ static inline void update_load_set(struct load_weight *lw, unsigned long w)
  *
  * This idea comes from the SD scheduler of Con Kolivas:
  */
+#ifdef CONFIG_SCHED_BORE
+static void update_sysctl(void) {
+	sysctl_sched_base_slice = nsecs_per_tick *
+		max(1UL, DIV_ROUND_UP(sysctl_sched_min_base_slice, nsecs_per_tick));
+}
+void sched_update_min_base_slice(void) { update_sysctl(); }
+#else // !CONFIG_SCHED_BORE
 static unsigned int get_update_sysctl_factor(void)
 {
 	unsigned int cpus = min_t(unsigned int, num_online_cpus(), 8);
@@ -261,6 +285,7 @@ static void update_sysctl(void)
 	SET_SYSCTL(sched_base_slice);
 #undef SET_SYSCTL
 }
+#endif // CONFIG_SCHED_BORE
 
 void __init sched_init_granularity(void)
 {
@@ -554,7 +579,7 @@ static int cfs_rq_is_idle(struct cfs_rq *cfs_rq)
 
 static int se_is_idle(struct sched_entity *se)
 {
-	return 0;
+	return task_has_idle_policy(task_of(se));
 }
 
 #endif	/* CONFIG_FAIR_GROUP_SCHED */
@@ -738,6 +763,9 @@ static s64 entity_lag(u64 avruntime, struct sched_entity *se)
 
 	vlag = avruntime - se->vruntime;
 	limit = calc_delta_fair(max_t(u64, 2*se->slice, TICK_NSEC), se);
+#ifdef CONFIG_SCHED_BORE
+	limit >>= !!sched_bore;
+#endif // CONFIG_SCHED_BORE
 
 	return clamp(vlag, -limit, limit);
 }
@@ -941,6 +969,9 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
 	 * until it gets a new slice. See the HACK in set_next_entity().
 	 */
 	if (sched_feat(RUN_TO_PARITY) && curr && curr->vlag == curr->deadline)
+#ifdef CONFIG_SCHED_BORE
+		if (!curr->bore_stats || !curr->bore_stats->waiting_for_futex || unlikely(!sched_bore))
+#endif // CONFIG_SCHED_BORE
 		return curr;
 
 	/* Pick the leftmost entity if it's eligible */
@@ -999,6 +1030,7 @@ struct sched_entity *__pick_last_entity(struct cfs_rq *cfs_rq)
  * Scheduling class statistics methods:
  */
 #ifdef CONFIG_SMP
+#if !defined(CONFIG_SCHED_BORE)
 int sched_update_scaling(void)
 {
 	unsigned int factor = get_update_sysctl_factor();
@@ -1010,6 +1042,7 @@ int sched_update_scaling(void)
 
 	return 0;
 }
+#endif // CONFIG_SCHED_BORE
 #endif
 #endif
 
@@ -1185,6 +1218,9 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	curr->sum_exec_runtime += delta_exec;
 	schedstat_add(cfs_rq->exec_clock, delta_exec);
 
+#ifdef CONFIG_SCHED_BORE
+	update_curr_bore(delta_exec, curr);
+#endif // CONFIG_SCHED_BORE
 	curr->vruntime += calc_delta_fair(delta_exec, curr);
 	update_deadline(cfs_rq, curr);
 	update_min_vruntime(cfs_rq);
@@ -3194,7 +3230,7 @@ static void reset_ptenuma_scan(struct task_struct *p)
 	p->mm->numa_scan_offset = 0;
 }
 
-static bool vma_is_accessed(struct vm_area_struct *vma)
+static bool vma_is_accessed(struct mm_struct *mm, struct vm_area_struct *vma)
 {
 	unsigned long pids;
 	/*
@@ -3203,11 +3239,32 @@ static bool vma_is_accessed(struct vm_area_struct *vma)
 	 * This is also done to avoid any side effect of task scanning
 	 * amplifying the unfairness of disjoint set of VMAs' access.
 	 */
-	if (READ_ONCE(current->mm->numa_scan_seq) < 2)
+	if ((READ_ONCE(current->mm->numa_scan_seq) - vma->numab_state->start_scan_seq) < 2)
 		return true;
 
-	pids = vma->numab_state->access_pids[0] | vma->numab_state->access_pids[1];
-	return test_bit(hash_32(current->pid, ilog2(BITS_PER_LONG)), &pids);
+	pids = vma->numab_state->pids_active[0] | vma->numab_state->pids_active[1];
+	if (test_bit(hash_32(current->pid, ilog2(BITS_PER_LONG)), &pids))
+		return true;
+
+	/*
+	 * Complete a scan that has already started regardless of PID access, or
+	 * some VMAs may never be scanned in multi-threaded applications:
+	 */
+	if (mm->numa_scan_offset > vma->vm_start) {
+		trace_sched_skip_vma_numa(mm, vma, NUMAB_SKIP_IGNORE_PID);
+		return true;
+	}
+
+	/*
+	 * This vma has not been accessed for a while, and if the number
+	 * the threads in the same process is low, which means no other
+	 * threads can help scan this vma, force a vma scan.
+	 */
+	if (READ_ONCE(mm->numa_scan_seq) >
+	   (vma->numab_state->prev_scan_seq + get_nr_threads(current)))
+		return true;
+
+	return false;
 }
 
 #define VMA_PID_RESET_PERIOD (4 * sysctl_numa_balancing_scan_delay)
@@ -3227,6 +3284,8 @@ static void task_numa_work(struct callback_head *work)
 	unsigned long nr_pte_updates = 0;
 	long pages, virtpages;
 	struct vma_iterator vmi;
+	bool vma_pids_skipped;
+	bool vma_pids_forced = false;
 
 	SCHED_WARN_ON(p != container_of(work, struct task_struct, numa_work));
 
@@ -3269,7 +3328,6 @@ static void task_numa_work(struct callback_head *work)
 	 */
 	p->node_stamp += 2 * TICK_NSEC;
 
-	start = mm->numa_scan_offset;
 	pages = sysctl_numa_balancing_scan_size;
 	pages <<= 20 - PAGE_SHIFT; /* MB in pages */
 	virtpages = pages * 8;	   /* Scan up to this much virtual space */
@@ -3279,6 +3337,16 @@ static void task_numa_work(struct callback_head *work)
 
 	if (!mmap_read_trylock(mm))
 		return;
+
+	/*
+	 * VMAs are skipped if the current PID has not trapped a fault within
+	 * the VMA recently. Allow scanning to be forced if there is no
+	 * suitable VMA remaining.
+	 */
+	vma_pids_skipped = false;
+
+retry_pids:
+	start = mm->numa_scan_offset;
 	vma_iter_init(&vmi, mm, start);
 	vma = vma_next(&vmi);
 	if (!vma) {
@@ -3288,9 +3356,10 @@ static void task_numa_work(struct callback_head *work)
 		vma = vma_next(&vmi);
 	}
 
-	do {
+	for (; vma; vma = vma_next(&vmi)) {
 		if (!vma_migratable(vma) || !vma_policy_mof(vma) ||
 			is_vm_hugetlb_page(vma) || (vma->vm_flags & VM_MIXEDMAP)) {
+			trace_sched_skip_vma_numa(mm, vma, NUMAB_SKIP_UNSUITABLE);
 			continue;
 		}
 
@@ -3301,29 +3370,48 @@ static void task_numa_work(struct callback_head *work)
 		 * as migrating the pages will be of marginal benefit.
 		 */
 		if (!vma->vm_mm ||
-		    (vma->vm_file && (vma->vm_flags & (VM_READ|VM_WRITE)) == (VM_READ)))
+		    (vma->vm_file && (vma->vm_flags & (VM_READ|VM_WRITE)) == (VM_READ))) {
+			trace_sched_skip_vma_numa(mm, vma, NUMAB_SKIP_SHARED_RO);
 			continue;
+		}
 
 		/*
 		 * Skip inaccessible VMAs to avoid any confusion between
 		 * PROT_NONE and NUMA hinting ptes
 		 */
-		if (!vma_is_accessible(vma))
+		if (!vma_is_accessible(vma)) {
+			trace_sched_skip_vma_numa(mm, vma, NUMAB_SKIP_INACCESSIBLE);
 			continue;
+		}
 
 		/* Initialise new per-VMA NUMAB state. */
 		if (!vma->numab_state) {
-			vma->numab_state = kzalloc(sizeof(struct vma_numab_state),
-				GFP_KERNEL);
-			if (!vma->numab_state)
+			struct vma_numab_state *ptr;
+
+			ptr = kzalloc(sizeof(*ptr), GFP_KERNEL);
+			if (!ptr)
 				continue;
+
+			if (cmpxchg(&vma->numab_state, NULL, ptr)) {
+				kfree(ptr);
+				continue;
+			}
+
+			vma->numab_state->start_scan_seq = mm->numa_scan_seq;
 
 			vma->numab_state->next_scan = now +
 				msecs_to_jiffies(sysctl_numa_balancing_scan_delay);
 
 			/* Reset happens after 4 times scan delay of scan start */
-			vma->numab_state->next_pid_reset =  vma->numab_state->next_scan +
+			vma->numab_state->pids_active_reset =  vma->numab_state->next_scan +
 				msecs_to_jiffies(VMA_PID_RESET_PERIOD);
+
+			/*
+			 * Ensure prev_scan_seq does not match numa_scan_seq,
+			 * to prevent VMAs being skipped prematurely on the
+			 * first scan:
+			 */
+			 vma->numab_state->prev_scan_seq = mm->numa_scan_seq - 1;
 		}
 
 		/*
@@ -3331,23 +3419,35 @@ static void task_numa_work(struct callback_head *work)
 		 * delay the scan for new VMAs.
 		 */
 		if (mm->numa_scan_seq && time_before(jiffies,
-						vma->numab_state->next_scan))
+						vma->numab_state->next_scan)) {
+			trace_sched_skip_vma_numa(mm, vma, NUMAB_SKIP_SCAN_DELAY);
 			continue;
+		}
 
-		/* Do not scan the VMA if task has not accessed */
-		if (!vma_is_accessed(vma))
+		/* RESET access PIDs regularly for old VMAs. */
+		if (mm->numa_scan_seq &&
+				time_after(jiffies, vma->numab_state->pids_active_reset)) {
+			vma->numab_state->pids_active_reset = vma->numab_state->pids_active_reset +
+				msecs_to_jiffies(VMA_PID_RESET_PERIOD);
+			vma->numab_state->pids_active[0] = READ_ONCE(vma->numab_state->pids_active[1]);
+			vma->numab_state->pids_active[1] = 0;
+		}
+
+		/* Do not rescan VMAs twice within the same sequence. */
+		if (vma->numab_state->prev_scan_seq == mm->numa_scan_seq) {
+			mm->numa_scan_offset = vma->vm_end;
+			trace_sched_skip_vma_numa(mm, vma, NUMAB_SKIP_SEQ_COMPLETED);
 			continue;
+		}
 
 		/*
-		 * RESET access PIDs regularly for old VMAs. Resetting after checking
-		 * vma for recent access to avoid clearing PID info before access..
+		 * Do not scan the VMA if task has not accessed it, unless no other
+		 * VMA candidate exists.
 		 */
-		if (mm->numa_scan_seq &&
-				time_after(jiffies, vma->numab_state->next_pid_reset)) {
-			vma->numab_state->next_pid_reset = vma->numab_state->next_pid_reset +
-				msecs_to_jiffies(VMA_PID_RESET_PERIOD);
-			vma->numab_state->access_pids[0] = READ_ONCE(vma->numab_state->access_pids[1]);
-			vma->numab_state->access_pids[1] = 0;
+		if (!vma_pids_forced && !vma_is_accessed(mm, vma)) {
+			vma_pids_skipped = true;
+			trace_sched_skip_vma_numa(mm, vma, NUMAB_SKIP_PID_INACTIVE);
+			continue;
 		}
 
 		do {
@@ -3374,7 +3474,27 @@ static void task_numa_work(struct callback_head *work)
 
 			cond_resched();
 		} while (end != vma->vm_end);
-	} for_each_vma(vmi, vma);
+
+		/* VMA scan is complete, do not scan until next sequence. */
+		vma->numab_state->prev_scan_seq = mm->numa_scan_seq;
+
+		/*
+		 * Only force scan within one VMA at a time, to limit the
+		 * cost of scanning a potentially uninteresting VMA.
+		 */
+		if (vma_pids_forced)
+			break;
+	}
+
+	/*
+	 * If no VMAs are remaining and VMAs were skipped due to the PID
+	 * not accessing the VMA previously, then force a scan to ensure
+	 * forward progress:
+	 */
+	if (!vma && !vma_pids_forced && vma_pids_skipped) {
+		vma_pids_forced = true;
+		goto retry_pids;
+	}
 
 out:
 	/*
@@ -3744,14 +3864,23 @@ static void reweight_eevdf(struct sched_entity *se, u64 avruntime,
 	se->deadline = avruntime + vslice;
 }
 
+
+#ifdef CONFIG_SCHED_BORE
+void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
+			    unsigned long weight, bool no_update_curr)
+#else // !CONFIG_SCHED_BORE
 static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 			    unsigned long weight)
+#endif // CONFIG_SCHED_BORE
 {
 	bool curr = cfs_rq->curr == se;
 	u64 avruntime;
 
 	if (se->on_rq) {
 		/* commit outstanding execution time */
+#ifdef CONFIG_SCHED_BORE
+		if (!no_update_curr)
+#endif // CONFIG_SCHED_BORE
 		update_curr(cfs_rq);
 		avruntime = avg_vruntime(cfs_rq);
 		if (!curr)
@@ -3805,7 +3934,11 @@ void reweight_task(struct task_struct *p, int prio)
 	struct load_weight *load = &se->load;
 	unsigned long weight = scale_load(sched_prio_to_weight[prio]);
 
+#ifdef CONFIG_SCHED_BORE
+	reweight_entity(cfs_rq, se, weight, false);
+#else // !CONFIG_SCHED_BORE
 	reweight_entity(cfs_rq, se, weight);
+#endif // CONFIG_SCHED_BORE
 	load->inv_weight = sched_prio_to_wmult[prio];
 }
 EXPORT_SYMBOL_GPL(reweight_task);
@@ -3943,7 +4076,11 @@ static void update_cfs_group(struct sched_entity *se)
 	shares = calc_group_shares(gcfs_rq);
 #endif
 	if (unlikely(se->load.weight != shares))
+#ifdef CONFIG_SCHED_BORE
+		reweight_entity(cfs_rq_of(se), se, shares, false);
+#else // !CONFIG_SCHED_BORE
 		reweight_entity(cfs_rq_of(se), se, shares);
+#endif // CONFIG_SCHED_BORE
 }
 
 #else /* CONFIG_FAIR_GROUP_SCHED */
@@ -4017,14 +4154,16 @@ static inline bool child_cfs_rq_on_list(struct cfs_rq *cfs_rq)
 {
 	struct cfs_rq *prev_cfs_rq;
 	struct list_head *prev;
+	struct rq *rq = rq_of(cfs_rq);
 
 	if (cfs_rq->on_list) {
 		prev = cfs_rq->leaf_cfs_rq_list.prev;
 	} else {
-		struct rq *rq = rq_of(cfs_rq);
-
 		prev = rq->tmp_alone_branch;
 	}
+
+	if (prev == &rq->leaf_cfs_rq_list)
+		return false;
 
 	prev_cfs_rq = container_of(prev, struct cfs_rq, leaf_cfs_rq_list);
 
@@ -5116,7 +5255,10 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 *
 	 * EEVDF: placement strategy #1 / #2
 	 */
-	if (sched_feat(PLACE_LAG) && cfs_rq->nr_running) {
+#ifdef CONFIG_SCHED_BORE
+	if (se->vlag)
+#endif // CONFIG_SCHED_BORE
+	if (sched_feat(PLACE_LAG) && cfs_rq->nr_running && se->vlag) {
 		struct sched_entity *curr = cfs_rq->curr;
 		unsigned long load;
 
@@ -5186,8 +5328,13 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	se->vruntime = vruntime - lag;
 
+#ifdef CONFIG_SCHED_BORE
+	if (likely(sched_bore))
+		vslice >>= !!(flags & sched_deadline_boost_mask);
+	else
+#endif // CONFIG_SCHED_BORE
 	/*
-	 * When joining the competition; the exisiting tasks will be,
+	 * When joining the competition; the existing tasks will be,
 	 * on average, halfway through their slice, as such start tasks
 	 * off with half a slice to ease into the competition.
 	 */
@@ -5323,6 +5470,7 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	clear_buddies(cfs_rq, se);
 
 	update_entity_lag(cfs_rq, se);
+
 	if (se != cfs_rq->curr)
 		__dequeue_entity(cfs_rq, se);
 	se->on_rq = 0;
@@ -6600,27 +6748,47 @@ static inline void hrtick_update(struct rq *rq)
 #ifdef CONFIG_SMP
 static inline bool cpu_overutilized(int cpu)
 {
-	unsigned long rq_util_min = uclamp_rq_get(cpu_rq(cpu), UCLAMP_MIN);
-	unsigned long rq_util_max = uclamp_rq_get(cpu_rq(cpu), UCLAMP_MAX);
+	unsigned long  rq_util_min, rq_util_max;
 	int overutilized = -1;
 
 	trace_android_rvh_cpu_overutilized(cpu, &overutilized);
 	if (overutilized != -1)
 		return overutilized;
 
+	if (!sched_energy_enabled())
+		return false;
+
+	rq_util_min = uclamp_rq_get(cpu_rq(cpu), UCLAMP_MIN);
+	rq_util_max = uclamp_rq_get(cpu_rq(cpu), UCLAMP_MAX);
+
 	/* Return true only if the utilization doesn't fit CPU's capacity */
 	return !util_fits_cpu(cpu_util_cfs(cpu), rq_util_min, rq_util_max, cpu);
 }
 
-static inline void update_overutilized_status(struct rq *rq)
+static inline void set_rd_overutilized_status(struct root_domain *rd,
+					      unsigned int status)
 {
-	if (!READ_ONCE(rq->rd->overutilized) && cpu_overutilized(rq->cpu)) {
-		WRITE_ONCE(rq->rd->overutilized, SG_OVERUTILIZED);
-		trace_sched_overutilized_tp(rq->rd, SG_OVERUTILIZED);
-	}
+	if (!sched_energy_enabled())
+		return;
+
+	WRITE_ONCE(rd->overutilized, status);
+	trace_sched_overutilized_tp(rd, !!status);
+}
+
+static inline void check_update_overutilized_status(struct rq *rq)
+{
+	/*
+	 * overutilized field is used for load balancing decisions only
+	 * if energy aware scheduler is being used
+	 */
+	if (!sched_energy_enabled())
+		return;
+
+	if (!READ_ONCE(rq->rd->overutilized) && cpu_overutilized(rq->cpu))
+		set_rd_overutilized_status(rq->rd, SG_OVERUTILIZED);
 }
 #else
-static inline void update_overutilized_status(struct rq *rq) { }
+static inline void check_update_overutilized_status(struct rq *rq) { }
 #endif
 
 /* Runqueue only has SCHED_IDLE tasks enqueued */
@@ -6725,7 +6893,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	 * and the following generally works well enough in practice.
 	 */
 	if (!task_new)
-		update_overutilized_status(rq);
+		check_update_overutilized_status(rq);
 
 enqueue_throttle:
 	assert_list_leaf_cfs_rq(rq);
@@ -6749,6 +6917,14 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	bool was_sched_idle = sched_idle_rq(rq);
 
 	util_est_dequeue(&rq->cfs, p);
+#ifdef CONFIG_SCHED_BORE
+	if (task_sleep) {
+		cfs_rq = cfs_rq_of(se);
+		if (cfs_rq->curr == se)
+			update_curr(cfs_rq);
+		restart_burst(se);
+	}
+#endif // CONFIG_SCHED_BORE
 
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
@@ -7160,9 +7336,14 @@ static inline int find_idlest_cpu(struct sched_domain *sd, struct task_struct *p
 	return new_cpu;
 }
 
+static inline bool is_idle_cpu(int cpu)
+{
+	return available_idle_cpu(cpu) || sched_idle_cpu(cpu);
+}
+
 static inline int __select_idle_cpu(int cpu, struct task_struct *p)
 {
-	if ((available_idle_cpu(cpu) || sched_idle_cpu(cpu)) &&
+	if (is_idle_cpu(cpu) &&
 	    sched_cpu_cookie_match(cpu_rq(cpu), p))
 		return cpu;
 
@@ -7172,6 +7353,24 @@ static inline int __select_idle_cpu(int cpu, struct task_struct *p)
 #ifdef CONFIG_SCHED_SMT
 DEFINE_STATIC_KEY_FALSE(sched_smt_present);
 EXPORT_SYMBOL_GPL(sched_smt_present);
+
+/*
+ * Return true if all the CPUs in the SMT core where @cpu belongs are idle,
+ * false otherwise.
+ */
+static bool is_idle_core(int cpu)
+{
+	int sibling;
+
+	if (!sched_smt_active())
+		return is_idle_cpu(cpu);
+
+	for_each_cpu(sibling, cpu_smt_mask(cpu))
+		if (!is_idle_cpu(sibling))
+			return false;
+
+	return true;
+}
 
 static inline void set_idle_cores(int cpu, int val)
 {
@@ -7255,29 +7454,6 @@ static int select_idle_core(struct task_struct *p, int core, struct cpumask *cpu
 	return -1;
 }
 
-/*
- * Scan the local SMT mask for idle CPUs.
- */
-static int select_idle_smt(struct task_struct *p, struct sched_domain *sd, int target)
-{
-	int cpu;
-
-	for_each_cpu_and(cpu, cpu_smt_mask(target), p->cpus_ptr) {
-		if (cpu == target)
-			continue;
-		/*
-		 * Check if the CPU is in the LLC scheduling domain of @target.
-		 * Due to isolcpus, there is no guarantee that all the siblings are in the domain.
-		 */
-		if (!cpumask_test_cpu(cpu, sched_domain_span(sd)))
-			continue;
-		if (available_idle_cpu(cpu) || sched_idle_cpu(cpu))
-			return cpu;
-	}
-
-	return -1;
-}
-
 #else /* CONFIG_SCHED_SMT */
 
 static inline void set_idle_cores(int cpu, int val)
@@ -7294,9 +7470,9 @@ static inline int select_idle_core(struct task_struct *p, int core, struct cpuma
 	return __select_idle_cpu(core, p);
 }
 
-static inline int select_idle_smt(struct task_struct *p, struct sched_domain *sd, int target)
+static inline bool is_idle_core(int cpu)
 {
-	return -1;
+	return is_idle_cpu(cpu);
 }
 
 #endif /* CONFIG_SCHED_SMT */
@@ -7417,7 +7593,7 @@ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
 	for_each_cpu_wrap(cpu, cpus, target) {
 		unsigned long cpu_cap = capacity_of(cpu);
 
-		if (!available_idle_cpu(cpu) && !sched_idle_cpu(cpu))
+		if (!is_idle_cpu(cpu))
 			continue;
 
 		fits = util_fits_cpu(task_util, util_min, util_max, cpu);
@@ -7488,7 +7664,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	 */
 	lockdep_assert_irqs_disabled();
 
-	if ((available_idle_cpu(target) || sched_idle_cpu(target)) &&
+	if (is_idle_core(target) &&
 	    asym_fits_cpu(task_util, util_min, util_max, target))
 		return target;
 
@@ -7496,7 +7672,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	 * If the previous CPU is cache affine and idle, don't be stupid:
 	 */
 	if (prev != target && cpus_share_cache(prev, target) &&
-	    (available_idle_cpu(prev) || sched_idle_cpu(prev)) &&
+	    is_idle_core(prev) &&
 	    asym_fits_cpu(task_util, util_min, util_max, prev))
 		return prev;
 
@@ -7522,7 +7698,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	if (recent_used_cpu != prev &&
 	    recent_used_cpu != target &&
 	    cpus_share_cache(recent_used_cpu, target) &&
-	    (available_idle_cpu(recent_used_cpu) || sched_idle_cpu(recent_used_cpu)) &&
+	    is_idle_core(recent_used_cpu) &&
 	    cpumask_test_cpu(recent_used_cpu, p->cpus_ptr) &&
 	    asym_fits_cpu(task_util, util_min, util_max, recent_used_cpu)) {
 		return recent_used_cpu;
@@ -7552,15 +7728,8 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	if (!sd)
 		return target;
 
-	if (sched_smt_active()) {
+	if (sched_smt_active())
 		has_idle_core = test_idle_cores(target);
-
-		if (!has_idle_core && cpus_share_cache(prev, target)) {
-			i = select_idle_smt(p, sd, prev);
-			if ((unsigned int)i < nr_cpumask_bits)
-				return i;
-		}
-	}
 
 	i = select_idle_cpu(p, sd, has_idle_core, target);
 	if ((unsigned)i < nr_cpumask_bits)
@@ -8271,16 +8440,7 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	if (test_tsk_need_resched(curr))
 		return;
 
-	/* Idle tasks are by definition preempted by non-idle tasks. */
-	if (unlikely(task_has_idle_policy(curr)) &&
-	    likely(!task_has_idle_policy(p)))
-		goto preempt;
-
-	/*
-	 * Batch and idle tasks do not preempt non-idle tasks (their preemption
-	 * is driven by the tick):
-	 */
-	if (unlikely(p->policy != SCHED_NORMAL) || !sched_feat(WAKEUP_PREEMPTION))
+	if (!sched_feat(WAKEUP_PREEMPTION))
 		return;
 
 	find_matching_se(&se, &pse);
@@ -8290,12 +8450,18 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	pse_is_idle = se_is_idle(pse);
 
 	/*
-	 * Preempt an idle group in favor of a non-idle group (and don't preempt
+	 * Preempt an idle entity in favor of a non-idle entity (and don't preempt
 	 * in the inverse case).
 	 */
 	if (cse_is_idle && !pse_is_idle)
 		goto preempt;
 	if (cse_is_idle != pse_is_idle)
+		return;
+
+	/*
+	 * BATCH and IDLE tasks do not preempt others.
+	 */
+	if (unlikely(p->policy != SCHED_NORMAL))
 		return;
 
 	cfs_rq = cfs_rq_of(se);
@@ -8307,6 +8473,7 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 		goto preempt;
 	if (ignore)
 		return;
+
 	/*
 	 * XXX pick_eevdf(cfs_rq) != se ?
 	 */
@@ -8533,16 +8700,25 @@ static void yield_task_fair(struct rq *rq)
 	/*
 	 * Are we the only task in the tree?
 	 */
+#if !defined(CONFIG_SCHED_BORE)
 	if (unlikely(rq->nr_running == 1))
 		return;
 
 	clear_buddies(cfs_rq, se);
+#endif // CONFIG_SCHED_BORE
 
 	update_rq_clock(rq);
 	/*
 	 * Update run-time statistics of the 'current'.
 	 */
 	update_curr(cfs_rq);
+#ifdef CONFIG_SCHED_BORE
+	restart_burst_rescale_deadline(se);
+	if (unlikely(rq->nr_running == 1))
+		return;
+
+	clear_buddies(cfs_rq, se);
+#endif // CONFIG_SCHED_BORE
 	/*
 	 * Tell update_rq_clock() that we've just updated,
 	 * so we don't do microscopic update in schedule()
@@ -9068,12 +9244,8 @@ static int detach_tasks(struct lb_env *env)
 			break;
 
 		env->loop++;
-		/*
-		 * We've more or less seen every task there is, call it quits
-		 * unless we haven't found any movable task yet.
-		 */
-		if (env->loop > env->loop_max &&
-		    !(env->flags & LBF_ALL_PINNED))
+		/* We've more or less seen every task there is, call it quits */
+		if (env->loop > env->loop_max)
 			break;
 
 		/* take a breather every nr_migrate tasks */
@@ -9118,7 +9290,7 @@ static int detach_tasks(struct lb_env *env)
 		case migrate_util:
 			util = task_util_est(p);
 
-			if (util > env->imbalance)
+			if (shr_bound(util, env->sd->nr_balance_failed) > env->imbalance)
 				goto next;
 
 			env->imbalance -= util;
@@ -9767,7 +9939,7 @@ static bool sched_use_asym_prio(struct sched_domain *sd, int cpu)
  * can only do it if @group is an SMT group and has exactly on busy CPU. Larger
  * imbalances in the number of CPUS are dealt with in find_busiest_group().
  *
- * If we are balancing load within an SMT core, or at DIE domain level, always
+ * If we are balancing load within an SMT core, or at PKG domain level, always
  * proceed.
  *
  * Return: true if @env::dst_cpu can do with asym_packing load balance. False
@@ -10625,19 +10797,14 @@ next_group:
 		env->fbq_type = fbq_classify_group(&sds->busiest_stat);
 
 	if (!env->sd->parent) {
-		struct root_domain *rd = env->dst_rq->rd;
-
 		/* update overload indicator if we are at root domain */
-		WRITE_ONCE(rd->overload, sg_status & SG_OVERLOAD);
+		WRITE_ONCE(env->dst_rq->rd->overload, sg_status & SG_OVERLOAD);
 
 		/* Update over-utilization (tipping point, U >= 0) indicator */
-		WRITE_ONCE(rd->overutilized, sg_status & SG_OVERUTILIZED);
-		trace_sched_overutilized_tp(rd, sg_status & SG_OVERUTILIZED);
+		set_rd_overutilized_status(env->dst_rq->rd,
+					   sg_status & SG_OVERUTILIZED);
 	} else if (sg_status & SG_OVERUTILIZED) {
-		struct root_domain *rd = env->dst_rq->rd;
-
-		WRITE_ONCE(rd->overutilized, SG_OVERUTILIZED);
-		trace_sched_overutilized_tp(rd, SG_OVERUTILIZED);
+		set_rd_overutilized_status(env->dst_rq->rd, SG_OVERUTILIZED);
 	}
 
 	update_idle_cpu_scan(env, sum_util);
@@ -11380,9 +11547,7 @@ more_balance:
 
 		if (env.flags & LBF_NEED_BREAK) {
 			env.flags &= ~LBF_NEED_BREAK;
-			/* Stop if we tried all running tasks */
-			if (env.loop < busiest->nr_running)
-				goto more_balance;
+			goto more_balance;
 		}
 
 		/*
@@ -12183,7 +12348,7 @@ static void _nohz_idle_balance(struct rq *this_rq, unsigned int flags)
 		 * work being done for other CPUs. Next load
 		 * balancing owner will pick it up.
 		 */
-		if (need_resched()) {
+		if (!idle_cpu(this_cpu) && need_resched()) {
 			if (flags & NOHZ_STATS_KICK)
 				has_blocked_load = true;
 			if (flags & NOHZ_NEXT_KICK)
@@ -12658,7 +12823,7 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 		task_tick_numa(rq, curr);
 
 	update_misfit_status(curr, rq);
-	update_overutilized_status(task_rq(curr));
+	check_update_overutilized_status(task_rq(curr));
 
 	task_tick_core(rq, curr);
 }
@@ -12682,6 +12847,9 @@ static void task_fork_fair(struct task_struct *p)
 	curr = cfs_rq->curr;
 	if (curr)
 		update_curr(cfs_rq);
+#ifdef CONFIG_SCHED_BORE
+	update_burst_score(se);
+#endif // CONFIG_SCHED_BORE
 	place_entity(cfs_rq, se, ENQUEUE_INITIAL);
 	rq_unlock(rq, &rf);
 }
@@ -12799,6 +12967,9 @@ static void switched_from_fair(struct rq *rq, struct task_struct *p)
 
 static void switched_to_fair(struct rq *rq, struct task_struct *p)
 {
+#ifdef CONFIG_SCHED_BORE
+	reset_task_bore(p);
+#endif // CONFIG_SCHED_BORE
 	attach_task_cfs_rq(p);
 
 	if (task_on_rq_queued(p)) {

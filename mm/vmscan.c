@@ -17,7 +17,9 @@
 #include <linux/module.h>
 #include <linux/gfp.h>
 #include <linux/kernel_stat.h>
+#include <linux/kfifo.h>
 #include <linux/swap.h>
+#include <linux/zswap.h>
 #include <linux/pagemap.h>
 #include <linux/init.h>
 #include <linux/highmem.h>
@@ -73,6 +75,9 @@
 
 #undef CREATE_TRACE_POINTS
 #include <trace/hooks/vmscan.h>
+#include <trace/hooks/mm.h>
+
+#undef CREATE_TRACE_POINTS
 #include <trace/hooks/mm.h>
 
 EXPORT_TRACEPOINT_SYMBOL_GPL(mm_vmscan_direct_reclaim_begin);
@@ -142,6 +147,15 @@ struct scan_control {
 	/* The file folios on the current node are dangerously low */
 	unsigned int file_is_tiny:1;
 
+	/* The anonymous pages on the current node are below vm.anon_min_ratio */
+	unsigned int anon_below_min:1;
+
+	/* The clean file pages on the current node are below vm.clean_low_ratio */
+	unsigned int clean_below_low:1;
+
+	/* The clean file pages on the current node are below vm.clean_min_ratio */
+	unsigned int clean_below_min:1;
+
 	/* Always discard instead of demoting to lower tier memory */
 	unsigned int no_demotion:1;
 
@@ -191,6 +205,15 @@ struct scan_control {
 #else
 #define prefetchw_prev_lru_folio(_folio, _base, _field) do { } while (0)
 #endif
+
+bool sysctl_workingset_protection __read_mostly = true;
+u8 sysctl_anon_min_ratio  __read_mostly = CONFIG_ANON_MIN_RATIO;
+u8 sysctl_clean_low_ratio __read_mostly = CONFIG_CLEAN_LOW_RATIO;
+u8 sysctl_clean_min_ratio __read_mostly = CONFIG_CLEAN_MIN_RATIO;
+static u64 sysctl_anon_min_ratio_kb  __read_mostly = 0;
+static u64 sysctl_clean_low_ratio_kb __read_mostly = 0;
+static u64 sysctl_clean_min_ratio_kb __read_mostly = 0;
+static u64 workingset_protection_prev_totalram __read_mostly = 0;
 
 /*
  * From 0 .. 200.  Higher means more swappy.
@@ -650,7 +673,14 @@ unsigned long zone_reclaimable_pages(struct zone *zone)
 	if (can_reclaim_anon_pages(NULL, zone_to_nid(zone), NULL))
 		nr += zone_page_state_snapshot(zone, NR_ZONE_INACTIVE_ANON) +
 			zone_page_state_snapshot(zone, NR_ZONE_ACTIVE_ANON);
-
+	/*
+	 * If there are no reclaimable file-backed or anonymous pages,
+	 * ensure zones with sufficient free pages are not skipped.
+	 * This prevents zones like DMA32 from being ignored in reclaim
+	 * scenarios where they can still help alleviate memory pressure.
+	 */
+	if (nr == 0)
+		nr = zone_page_state_snapshot(zone, NR_FREE_PAGES);
 	return nr;
 }
 
@@ -855,6 +885,7 @@ static unsigned long do_shrink_slab(struct shrink_control *shrinkctl,
 
 	freeable = shrinker->count_objects(shrinker, shrinkctl);
 	trace_android_vh_do_shrink_slab(shrinker, &freeable);
+	trace_android_vh_do_shrink_slab_ex(shrinkctl, shrinker, &freeable, priority);
 	if (freeable == 0 || freeable == SHRINK_EMPTY)
 		return freeable;
 
@@ -1468,8 +1499,15 @@ static int __remove_mapping(struct address_space *mapping, struct folio *folio,
 		 * same address_space.
 		 */
 		if (reclaimed && folio_is_file_lru(folio) &&
-		    !mapping_exiting(mapping) && !dax_mapping(mapping))
+		    !mapping_exiting(mapping) && !dax_mapping(mapping)) {
+			bool keep = false;
+
+			trace_android_vh_keep_reclaimed_folio(folio, refcount, &keep);
+			if (keep)
+				goto cannot_free;
 			shadow = workingset_eviction(folio, target_memcg);
+		}
+		trace_android_vh_clear_reclaimed_folio(folio, reclaimed);
 		__filemap_remove_folio(folio, shadow);
 		xa_unlock_irq(&mapping->i_pages);
 		if (mapping_shrinkable(mapping))
@@ -1543,6 +1581,7 @@ static enum folio_references folio_check_references(struct folio *folio,
 	int referenced_ptes, referenced_folio;
 	unsigned long vm_flags;
 	int ret = 0;
+	bool trylock_failed = false;
 
 #ifdef CONFIG_ANDROID_VENDOR_OEM_DATA
 	trace_android_vh_page_should_be_protected(folio, sc->nr_scanned,
@@ -1552,9 +1591,13 @@ static enum folio_references folio_check_references(struct folio *folio,
 	if (ret)
 		return ret;
 
+	trace_android_vh_folio_trylock_set(folio);
 	referenced_ptes = folio_referenced(folio, 1, sc->target_mem_cgroup,
 					   &vm_flags);
 	referenced_folio = folio_test_clear_referenced(folio);
+	trace_android_vh_get_folio_trylock_result(folio, &trylock_failed);
+	if (trylock_failed)
+		return FOLIOREF_KEEP;
 
 	/*
 	 * The supposedly reclaimable folio was found to be in a VM_LOCKED vma.
@@ -1563,7 +1606,12 @@ static enum folio_references folio_check_references(struct folio *folio,
 	if (vm_flags & VM_LOCKED)
 		return FOLIOREF_ACTIVATE;
 
-	/* rmap lock contention: rotate */
+	/*
+	 * There are two cases to consider.
+	 * 1) Rmap lock contention: rotate.
+	 * 2) Skip the non-shared swapbacked folio mapped solely by
+	 *    the exiting or OOM-reaped process.
+	 */
 	if (referenced_ptes == -1)
 		return FOLIOREF_KEEP;
 
@@ -1752,6 +1800,7 @@ retry:
 		unsigned int nr_pages;
 		bool activate = false;
 		bool keep = false;
+		bool should_split_to_list = false;
 
 		cond_resched();
 
@@ -1777,6 +1826,10 @@ retry:
 		/* folio_update_gen() tried to promote this page? */
 		if (lru_gen_enabled() && !ignore_references &&
 		    folio_mapped(folio) && folio_test_referenced(folio))
+			goto keep_locked;
+
+		if (folio_is_file_lru(folio) ? sc->clean_below_min :
+				(sc->anon_below_min && !sc->clean_below_min))
 			goto keep_locked;
 
 		/*
@@ -1933,14 +1986,21 @@ retry:
 				 * Split partially mapped folios right away.
 				 * We can free the unmapped pages without IO.
 				 */
+				trace_android_vh_should_split_folio_to_list(folio,
+					    &should_split_to_list);
 				if (folio_test_large(folio) &&
-				    data_race(!list_empty(&folio->_deferred_list)))
+				    (data_race(!list_empty(&folio->_deferred_list)) ||
+				    should_split_to_list))
 					split_folio_to_list(folio, folio_list);
 				if (!add_to_swap(folio)) {
 					int __maybe_unused order = folio_order(folio);
+					bool bypass = false;
 
 					if (!folio_test_large(folio))
 						goto activate_locked_split;
+					trace_android_vh_split_large_folio_bypass(&bypass);
+					if (bypass)
+						goto activate_locked;
 					/* Fallback to swap normal pages */
 					if (split_folio_to_list(folio, folio_list))
 						goto activate_locked;
@@ -2002,9 +2062,11 @@ retry:
 			 * try_to_unmap acquire PTL from the first PTE,
 			 * eliminating the influence of temporary PTE values.
 			 */
-			if (folio_test_large(folio) && list_empty(&folio->_deferred_list))
+			if (folio_test_large(folio))
 				flags |= TTU_SYNC;
 
+			if (!ignore_references)
+				trace_android_vh_folio_trylock_set(folio);
 			try_to_unmap(folio, flags);
 			if (folio_mapped(folio)) {
 				stat->nr_unmap_fail += nr_pages;
@@ -2135,6 +2197,7 @@ retry:
 					 * increment nr_reclaimed here (and
 					 * leave it off the LRU).
 					 */
+					trace_android_vh_folio_trylock_clear(folio);
 					nr_reclaimed += nr_pages;
 					continue;
 				}
@@ -2171,6 +2234,7 @@ free_it:
 		 * Is there need to periodically free_folio_list? It would
 		 * appear not as the counts should be low
 		 */
+		trace_android_vh_folio_trylock_clear(folio);
 		if (unlikely(folio_test_large(folio)))
 			destroy_large_folio(folio);
 		else
@@ -2317,25 +2381,6 @@ static __always_inline void update_lru_sizes(struct lruvec *lruvec,
 
 }
 
-#ifdef CONFIG_CMA
-/*
- * It is waste of effort to scan and reclaim CMA pages if it is not available
- * for current allocation context. Kswapd can not be enrolled as it can not
- * distinguish this scenario by using sc->gfp_mask = GFP_KERNEL
- */
-static bool skip_cma(struct folio *folio, struct scan_control *sc)
-{
-	return !current_is_kswapd() &&
-			gfp_migratetype(sc->gfp_mask) != MIGRATE_MOVABLE &&
-			get_pageblock_migratetype(&folio->page) == MIGRATE_CMA;
-}
-#else
-static bool skip_cma(struct folio *folio, struct scan_control *sc)
-{
-	return false;
-}
-#endif
-
 /*
  * Isolating page from the lruvec to fill in @dst list by nr_to_scan times.
  *
@@ -2369,6 +2414,12 @@ static unsigned long isolate_lru_folios(unsigned long nr_to_scan,
 	unsigned long skipped = 0;
 	unsigned long scan, total_scan, nr_pages;
 	LIST_HEAD(folios_skipped);
+	unsigned long nr_scanned_before = *nr_scanned;
+
+	trace_android_vh_mm_isolate_priv_lru(nr_to_scan, lruvec, lru, dst, sc->reclaim_idx,
+					     sc->may_unmap, nr_scanned, &nr_taken);
+	if (*nr_scanned != nr_scanned_before)
+		return nr_taken;
 
 	total_scan = 0;
 	scan = 0;
@@ -2382,8 +2433,7 @@ static unsigned long isolate_lru_folios(unsigned long nr_to_scan,
 		nr_pages = folio_nr_pages(folio);
 		total_scan += nr_pages;
 
-		if (folio_zonenum(folio) > sc->reclaim_idx ||
-				skip_cma(folio, sc)) {
+		if (folio_zonenum(folio) > sc->reclaim_idx) {
 			nr_skipped[folio_zonenum(folio)] += nr_pages;
 			move_to = &folios_skipped;
 			goto move;
@@ -2447,8 +2497,7 @@ move:
 	}
 	*nr_scanned = total_scan;
 	trace_mm_vmscan_lru_isolate(sc->reclaim_idx, sc->order, nr_to_scan,
-				    total_scan, skipped, nr_taken,
-				    sc->may_unmap ? 0 : ISOLATE_UNMAPPED, lru);
+				    total_scan, skipped, nr_taken, lru);
 	update_lru_sizes(lruvec, lru, nr_zone_taken);
 	return nr_taken;
 }
@@ -2623,12 +2672,12 @@ static int current_may_throttle(void)
  * shrink_inactive_list() is a helper for shrink_node().  It returns the number
  * of reclaimed pages
  */
-static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
+unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 		struct lruvec *lruvec, struct scan_control *sc,
 		enum lru_list lru)
 {
 	LIST_HEAD(folio_list);
-	unsigned long nr_scanned;
+	unsigned long nr_scanned = 0;
 	unsigned int nr_reclaimed = 0;
 	unsigned long nr_taken;
 	struct reclaim_stat stat;
@@ -2670,6 +2719,7 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 		return 0;
 
 	nr_reclaimed = shrink_folio_list(&folio_list, pgdat, sc, &stat, false);
+	trace_android_vh_handle_trylock_failed_folio(&folio_list);
 
 	spin_lock_irq(&lruvec->lru_lock);
 	move_folios_to_lru(lruvec, &folio_list);
@@ -2725,6 +2775,7 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 			nr_scanned, nr_reclaimed, &stat, sc->priority, file);
 	return nr_reclaimed;
 }
+EXPORT_SYMBOL(shrink_inactive_list);
 
 /*
  * shrink_active_list() moves folios from the active LRU to the inactive LRU.
@@ -2749,7 +2800,7 @@ static void shrink_active_list(unsigned long nr_to_scan,
 			       enum lru_list lru)
 {
 	unsigned long nr_taken;
-	unsigned long nr_scanned;
+	unsigned long nr_scanned = 0;
 	unsigned long vm_flags;
 	LIST_HEAD(l_hold);	/* The folios which were snipped off */
 	LIST_HEAD(l_active);
@@ -2808,6 +2859,8 @@ static void shrink_active_list(unsigned long nr_to_scan,
 		trace_android_vh_page_referenced_check_bypass(folio, nr_to_scan, lru, &bypass);
 		if (bypass)
 			goto skip_folio_referenced;
+
+		trace_android_vh_folio_trylock_set(folio);
 		/* Referenced or rmap lock contention: rotate */
 		if (folio_referenced(folio, 0, sc->target_mem_cgroup,
 				     &vm_flags) != 0) {
@@ -2821,11 +2874,13 @@ static void shrink_active_list(unsigned long nr_to_scan,
 			 * so we ignore them here.
 			 */
 			if ((vm_flags & VM_EXEC) && folio_is_file_lru(folio)) {
+				trace_android_vh_folio_trylock_clear(folio);
 				nr_rotated += folio_nr_pages(folio);
 				list_add(&folio->lru, &l_active);
 				continue;
 			}
 		}
+		trace_android_vh_folio_trylock_clear(folio);
 skip_folio_referenced:
 		folio_clear_active(folio);	/* we are de-activating */
 		folio_set_workingset(folio);
@@ -2858,7 +2913,8 @@ skip_folio_referenced:
 
 static unsigned int reclaim_folio_list(struct list_head *folio_list,
 				      struct pglist_data *pgdat,
-				      bool ignore_references)
+				      bool ignore_references,
+				      void *private)
 {
 	struct reclaim_stat dummy_stat;
 	unsigned int nr_reclaimed;
@@ -2872,16 +2928,21 @@ static unsigned int reclaim_folio_list(struct list_head *folio_list,
 	};
 
 	nr_reclaimed = shrink_folio_list(folio_list, pgdat, &sc, &dummy_stat, ignore_references);
-	while (!list_empty(folio_list)) {
-		folio = lru_to_folio(folio_list);
-		list_del(&folio->lru);
-		folio_putback_lru(folio);
+	if (private) {
+		trace_android_rvh_reclaim_folio_list(folio_list, private);
+	} else {
+		while (!list_empty(folio_list)) {
+			folio = lru_to_folio(folio_list);
+			list_del(&folio->lru);
+			folio_putback_lru(folio);
+		}
 	}
 
 	return nr_reclaimed;
 }
 
-unsigned long reclaim_pages(struct list_head *folio_list, bool ignore_references)
+unsigned long __reclaim_pages(struct list_head *folio_list, bool ignore_references,
+			    void *private)
 {
 	int nid;
 	unsigned int nr_reclaimed = 0;
@@ -2904,16 +2965,23 @@ unsigned long reclaim_pages(struct list_head *folio_list, bool ignore_references
 		}
 
 		nr_reclaimed += reclaim_folio_list(&node_folio_list, NODE_DATA(nid),
-						   ignore_references);
+						   ignore_references, private);
 		nid = folio_nid(lru_to_folio(folio_list));
 	} while (!list_empty(folio_list));
 
-	nr_reclaimed += reclaim_folio_list(&node_folio_list, NODE_DATA(nid), ignore_references);
+	nr_reclaimed += reclaim_folio_list(&node_folio_list, NODE_DATA(nid),
+					   ignore_references, private);
 
 	memalloc_noreclaim_restore(noreclaim_flag);
 
 	return nr_reclaimed;
 }
+
+unsigned long reclaim_pages(struct list_head *folio_list, bool ignore_references)
+{
+	return __reclaim_pages(folio_list, ignore_references, NULL);
+}
+EXPORT_SYMBOL_GPL(reclaim_pages);
 
 static unsigned long shrink_list(enum lru_list lru, unsigned long nr_to_scan,
 				 struct lruvec *lruvec, struct scan_control *sc)
@@ -2974,6 +3042,15 @@ static bool inactive_is_low(struct lruvec *lruvec, enum lru_list inactive_lru)
 		inactive_ratio = 1;
 
 	return inactive * inactive_ratio < active;
+}
+
+static void customize_sc_file_is_tiny(struct scan_control *sc)
+{
+	bool file_is_tiny = sc->file_is_tiny;
+
+	trace_android_vh_mm_customize_file_is_tiny(sc->may_swap, sc->order,
+						   sc->reclaim_idx, &file_is_tiny);
+	sc->file_is_tiny = file_is_tiny;
 }
 
 enum scan_balance {
@@ -3093,6 +3170,8 @@ static void prepare_scan_count(pg_data_t *pgdat, struct scan_control *sc)
 			!(sc->may_deactivate & DEACTIVATE_ANON) &&
 			anon >> sc->priority;
 	}
+
+	customize_sc_file_is_tiny(sc);
 }
 
 /*
@@ -3155,6 +3234,15 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
 	}
 
 	trace_android_rvh_set_balance_anon_file_reclaim(&balance_anon_file_reclaim);
+
+	/*
+	 * Force-scan anon if clean file pages is under vm.clean_low_ratio
+	 * or vm.clean_min_ratio.
+	 */
+	if (sc->clean_below_low || sc->clean_below_min) {
+		scan_balance = SCAN_ANON;
+		goto out;
+	}
 
 	/*
 	 * If there is enough inactive page cache, we do not reclaim
@@ -3303,6 +3391,14 @@ out:
 			BUG();
 		}
 
+		/*
+		 * Hard protection of the working set.
+		 * Don't reclaim anon/file pages when the amount is
+		 * below the watermark of the same type.
+		 */
+		if (file ? sc->clean_below_min : sc->anon_below_min)
+			scan = 0;
+
 		nr[lru] = scan;
 	}
 }
@@ -3320,6 +3416,96 @@ static bool can_age_anon_pages(struct pglist_data *pgdat,
 
 	/* Also valuable if anon pages can be demoted: */
 	return can_demote(pgdat->node_id, sc);
+}
+
+int vm_workingset_protection_update_handler(struct ctl_table *table, int write,
+		void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret = proc_dou8vec_minmax(table, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	workingset_protection_prev_totalram = 0;
+
+	return 0;
+}
+
+static void prepare_workingset_protection(pg_data_t *pgdat, struct scan_control *sc)
+{
+	unsigned long node_mem_total;
+	struct sysinfo i;
+
+	if (!(sysctl_workingset_protection)) {
+		sc->anon_below_min = 0;
+		sc->clean_below_low = 0;
+		sc->clean_below_min = 0;
+		return;
+	}
+
+	if (likely(sysctl_anon_min_ratio  ||
+	           sysctl_clean_low_ratio ||
+		       sysctl_clean_min_ratio)) {
+#ifdef CONFIG_NUMA
+		si_meminfo_node(&i, pgdat->node_id);
+#else //CONFIG_NUMA
+		si_meminfo(&i);
+#endif //CONFIG_NUMA
+		node_mem_total = i.totalram;
+
+		if (unlikely(workingset_protection_prev_totalram != node_mem_total)) {
+			sysctl_anon_min_ratio_kb  =
+				node_mem_total * sysctl_anon_min_ratio  / 100;
+			sysctl_clean_low_ratio_kb =
+				node_mem_total * sysctl_clean_low_ratio / 100;
+			sysctl_clean_min_ratio_kb =
+				node_mem_total * sysctl_clean_min_ratio / 100;
+			workingset_protection_prev_totalram = node_mem_total;
+		}
+	}
+
+	/*
+	 * Check the number of anonymous pages to protect them from
+	 * reclaiming if their amount is below the specified.
+	 */
+	if (sysctl_anon_min_ratio) {
+		unsigned long reclaimable_anon;
+
+		reclaimable_anon =
+			node_page_state(pgdat, NR_ACTIVE_ANON) +
+			node_page_state(pgdat, NR_INACTIVE_ANON) +
+			node_page_state(pgdat, NR_ISOLATED_ANON);
+
+		sc->anon_below_min = reclaimable_anon < sysctl_anon_min_ratio_kb;
+	} else
+		sc->anon_below_min = 0;
+
+	/*
+	 * Check the number of clean file pages to protect them from
+	 * reclaiming if their amount is below the specified.
+	 */
+	if (sysctl_clean_low_ratio || sysctl_clean_min_ratio) {
+		unsigned long reclaimable_file, dirty, clean;
+
+		reclaimable_file =
+			node_page_state(pgdat, NR_ACTIVE_FILE) +
+			node_page_state(pgdat, NR_INACTIVE_FILE) +
+			node_page_state(pgdat, NR_ISOLATED_FILE);
+		dirty = node_page_state(pgdat, NR_FILE_DIRTY);
+		/*
+		 * node_page_state() sum can go out of sync since
+		 * all the values are not read at once.
+		 */
+		if (likely(reclaimable_file > dirty))
+			clean = reclaimable_file - dirty;
+		else
+			clean = 0;
+
+		sc->clean_below_low = clean < sysctl_clean_low_ratio_kb;
+		sc->clean_below_min = clean < sysctl_clean_min_ratio_kb;
+	} else {
+		sc->clean_below_low = 0;
+		sc->clean_below_min = 0;
+	}
 }
 
 #ifdef CONFIG_LRU_GEN
@@ -4638,6 +4824,32 @@ done:
  *                          working set protection
  ******************************************************************************/
 
+static void set_initial_priority(struct pglist_data *pgdat, struct scan_control *sc)
+{
+	int priority;
+	unsigned long reclaimable;
+
+	if (sc->priority != DEF_PRIORITY || sc->nr_to_reclaim < MIN_LRU_BATCH)
+		return;
+	/*
+	 * Determine the initial priority based on
+	 * (total >> priority) * reclaimed_to_scanned_ratio = nr_to_reclaim,
+	 * where reclaimed_to_scanned_ratio = inactive / total.
+	 */
+	reclaimable = node_page_state(pgdat, NR_INACTIVE_FILE);
+	if (can_reclaim_anon_pages(NULL, pgdat->node_id, sc))
+		reclaimable += node_page_state(pgdat, NR_INACTIVE_ANON);
+
+	/* round down reclaimable and round up sc->nr_to_reclaim */
+	priority = fls_long(reclaimable) - 1 - fls_long(sc->nr_to_reclaim - 1);
+
+	/*
+	 * The estimation is based on LRU pages only, so cap it to prevent
+	 * overshoots of shrinker objects by large margins.
+	 */
+	sc->priority = clamp(priority, DEF_PRIORITY / 2, DEF_PRIORITY);
+}
+
 static bool lruvec_is_sizable(struct lruvec *lruvec, struct scan_control *sc)
 {
 	int gen, type, zone;
@@ -4671,19 +4883,17 @@ static bool lruvec_is_reclaimable(struct lruvec *lruvec, struct scan_control *sc
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	DEFINE_MIN_SEQ(lruvec);
 
-	/* see the comment on lru_gen_folio */
-	gen = lru_gen_from_seq(min_seq[LRU_GEN_FILE]);
-	birth = READ_ONCE(lruvec->lrugen.timestamps[gen]);
-
-	if (time_is_after_jiffies(birth + min_ttl))
+	if (mem_cgroup_below_min(NULL, memcg))
 		return false;
 
 	if (!lruvec_is_sizable(lruvec, sc))
 		return false;
 
-	mem_cgroup_calculate_protection(NULL, memcg);
+	/* see the comment on lru_gen_folio */
+	gen = lru_gen_from_seq(min_seq[LRU_GEN_FILE]);
+	birth = READ_ONCE(lruvec->lrugen.timestamps[gen]);
 
-	return !mem_cgroup_below_min(NULL, memcg);
+	return time_is_before_jiffies(birth + min_ttl);
 }
 
 /* to protect the working set of the last N jiffies */
@@ -4693,23 +4903,20 @@ static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
 {
 	struct mem_cgroup *memcg;
 	unsigned long min_ttl = READ_ONCE(lru_gen_min_ttl);
+	bool reclaimable = !min_ttl;
 
 	VM_WARN_ON_ONCE(!current_is_kswapd());
 
-	/* check the order to exclude compaction-induced reclaim */
-	if (!min_ttl || sc->order || sc->priority == DEF_PRIORITY)
-		return;
+	set_initial_priority(pgdat, sc);
 
 	memcg = mem_cgroup_iter(NULL, NULL, NULL);
 	do {
 		struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
 
-		if (lruvec_is_reclaimable(lruvec, sc, min_ttl)) {
-			mem_cgroup_iter_break(NULL, memcg);
-			return;
-		}
+		mem_cgroup_calculate_protection(NULL, memcg);
 
-		cond_resched();
+		if (!reclaimable)
+			reclaimable = lruvec_is_reclaimable(lruvec, sc, min_ttl);
 	} while ((memcg = mem_cgroup_iter(NULL, memcg, NULL)));
 
 	/*
@@ -4717,7 +4924,7 @@ static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
 	 * younger than min_ttl. However, another possibility is all memcgs are
 	 * either too small or below min.
 	 */
-	if (mutex_trylock(&oom_lock)) {
+	if (!reclaimable && mutex_trylock(&oom_lock)) {
 		struct oom_control oc = {
 			.gfp_mask = sc->gfp_mask,
 		};
@@ -4994,6 +5201,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
 		       int tier_idx)
 {
 	bool success;
+	bool dirty, writeback;
 	int gen = folio_lru_gen(folio);
 	int type = folio_is_file_lru(folio);
 	int zone = folio_zonenum(folio);
@@ -5042,15 +5250,23 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
 	}
 
 	/* ineligible */
-	if (zone > sc->reclaim_idx || skip_cma(folio, sc)) {
+	if (zone > sc->reclaim_idx) {
 		gen = folio_inc_gen(lruvec, folio, false);
 		list_move_tail(&folio->lru, &lrugen->folios[gen][type][zone]);
 		return true;
 	}
 
+	dirty = folio_test_dirty(folio);
+	writeback = folio_test_writeback(folio);
+	if (type == LRU_GEN_FILE && dirty) {
+		sc->nr.file_taken += delta;
+		if (!writeback)
+			sc->nr.unqueued_dirty += delta;
+	}
+
 	/* waiting for writeback */
-	if (folio_test_locked(folio) || folio_test_writeback(folio) ||
-	    (type == LRU_GEN_FILE && folio_test_dirty(folio))) {
+	if (folio_test_locked(folio) || writeback ||
+	    (type == LRU_GEN_FILE && dirty)) {
 		gen = folio_inc_gen(lruvec, folio, true);
 		list_move(&folio->lru, &lrugen->folios[gen][type][zone]);
 		return true;
@@ -5059,7 +5275,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
 	return false;
 }
 
-static bool isolate_folio(struct lruvec *lruvec, struct folio *folio, struct scan_control *sc)
+bool isolate_folio(struct lruvec *lruvec, struct folio *folio, struct scan_control *sc)
 {
 	bool success;
 
@@ -5092,6 +5308,7 @@ static bool isolate_folio(struct lruvec *lruvec, struct folio *folio, struct sca
 
 	return true;
 }
+EXPORT_SYMBOL_GPL(isolate_folio);
 
 static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
 		       int type, int tier, struct list_head *list)
@@ -5102,6 +5319,7 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
 	int sorted = 0;
 	int scanned = 0;
 	int isolated = 0;
+	int skipped = 0;
 	int remaining = MAX_LRU_BATCH;
 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
@@ -5115,7 +5333,7 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
 
 	for (i = MAX_NR_ZONES; i > 0; i--) {
 		LIST_HEAD(moved);
-		int skipped = 0;
+		int skipped_zone = 0;
 		int zone = (sc->reclaim_idx + i) % MAX_NR_ZONES;
 		struct list_head *head = &lrugen->folios[gen][type][zone];
 
@@ -5137,16 +5355,17 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
 				isolated += delta;
 			} else {
 				list_move(&folio->lru, &moved);
-				skipped += delta;
+				skipped_zone += delta;
 			}
 
-			if (!--remaining || max(isolated, skipped) >= MIN_LRU_BATCH)
+			if (!--remaining || max(isolated, skipped_zone) >= MIN_LRU_BATCH)
 				break;
 		}
 
-		if (skipped) {
+		if (skipped_zone) {
 			list_splice(&moved, head);
-			__count_zid_vm_events(PGSCAN_SKIP, zone, skipped);
+			__count_zid_vm_events(PGSCAN_SKIP, zone, skipped_zone);
+			skipped += skipped_zone;
 		}
 
 		if (!remaining || isolated >= MIN_LRU_BATCH)
@@ -5161,7 +5380,11 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
 	__count_memcg_events(memcg, item, isolated);
 	__count_memcg_events(memcg, PGREFILL, sorted);
 	__count_vm_events(PGSCAN_ANON + type, isolated);
-
+	trace_mm_vmscan_lru_isolate(sc->reclaim_idx, sc->order, MAX_LRU_BATCH,
+				scanned, skipped, isolated,
+				type ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON);
+	if (type == LRU_GEN_FILE)
+		sc->nr.file_taken += isolated;
 	/*
 	 * There might not be eligible folios due to reclaim_idx. Check the
 	 * remaining to prevent livelock if it's not making progress.
@@ -5233,6 +5456,12 @@ static int isolate_folios(struct lruvec *lruvec, struct scan_control *sc, int sw
 	 */
 	if (!swappiness)
 		type = LRU_GEN_FILE;
+	else if (sc->clean_below_min)
+		type = LRU_GEN_ANON;
+	else if (sc->anon_below_min)
+		type = LRU_GEN_FILE;
+	else if (sc->clean_below_low)
+		type = LRU_GEN_ANON;
 	else if (min_seq[LRU_GEN_ANON] < min_seq[LRU_GEN_FILE])
 		type = LRU_GEN_ANON;
 	else if (swappiness == 1)
@@ -5290,9 +5519,19 @@ static int evict_folios(struct lruvec *lruvec, struct scan_control *sc, int swap
 		return scanned;
 retry:
 	reclaimed = shrink_folio_list(&list, pgdat, sc, &stat, false);
+	sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
 	sc->nr_reclaimed += reclaimed;
+	trace_mm_vmscan_lru_shrink_inactive(pgdat->node_id,
+			scanned, reclaimed, &stat, sc->priority,
+			type ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON);
 
 	list_for_each_entry_safe_reverse(folio, next, &list, lru) {
+		bool bypass = false;
+
+		trace_android_vh_evict_folios_bypass(folio, &bypass);
+		if (bypass)
+			continue;
+
 		if (!folio_evictable(folio)) {
 			list_del(&folio->lru);
 			folio_putback_lru(folio);
@@ -5318,7 +5557,6 @@ retry:
 
 		/* retry folios that may have missed folio_rotate_reclaimable() */
 		list_move(&folio->lru, &clean);
-		sc->nr_scanned -= folio_nr_pages(folio);
 	}
 
 	spin_lock_irq(&lruvec->lru_lock);
@@ -5447,16 +5685,21 @@ static bool should_abort_scan(struct lruvec *lruvec, struct scan_control *sc)
 {
 	int i;
 	enum zone_watermarks mark;
+	bool bypass = false;
 
+#ifdef CONFIG_ANDROID_VENDOR_OEM_DATA
+	trace_android_vh_mglru_should_abort_scan(&sc->android_vendor_data1, &bypass);
+#endif
 	/* don't abort memcg reclaim to ensure fairness */
-	if (!root_reclaim(sc))
+	if (!root_reclaim(sc) && !bypass)
 		return false;
 
 	if (sc->nr_reclaimed >= max(sc->nr_to_reclaim, compact_gap(sc->order)))
 		return true;
 
+	trace_android_vh_mglru_should_abort_scan_order(sc->order, &bypass);
 	/* check the order to exclude compaction-induced reclaim */
-	if (!current_is_kswapd() || sc->order)
+	if ((!current_is_kswapd() || sc->order) && !bypass)
 		return false;
 
 	mark = sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING ?
@@ -5505,6 +5748,13 @@ static bool try_to_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 		cond_resched();
 	}
 
+	/*
+	 * If too many file cache in the coldest generation can't be evicted
+	 * due to being dirty, wake up the flusher.
+	 */
+	if (sc->nr.unqueued_dirty && sc->nr.unqueued_dirty == sc->nr.file_taken)
+		wakeup_flusher_threads(WB_REASON_VMSCAN);
+
 	/* whether this lruvec should be rotated */
 	return nr_to_scan < 0;
 }
@@ -5517,8 +5767,13 @@ static int shrink_one(struct lruvec *lruvec, struct scan_control *sc)
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 
-	mem_cgroup_calculate_protection(NULL, memcg);
+	prepare_workingset_protection(pgdat, sc);
 
+	if (sysctl_workingset_protection && sc->clean_below_min &&
+			!can_reclaim_anon_pages(memcg, pgdat->node_id, sc))
+		return 0;
+
+	/* lru_gen_age_node() called mem_cgroup_calculate_protection() */
 	if (mem_cgroup_below_min(NULL, memcg))
 		return MEMCG_LRU_YOUNG;
 
@@ -5563,6 +5818,7 @@ static void shrink_many(struct pglist_data *pgdat, struct scan_control *sc)
 	struct lru_gen_folio *lrugen;
 	struct mem_cgroup *memcg;
 	struct hlist_nulls_node *pos;
+	bool bypass = false;
 
 	gen = get_memcg_gen(READ_ONCE(pgdat->memcg_lru.seq));
 	bin = first_bin = get_random_u32_below(MEMCG_NR_BINS);
@@ -5592,6 +5848,10 @@ restart:
 			memcg = NULL;
 			continue;
 		}
+
+		trace_android_vh_should_memcg_bypass(memcg, sc->priority, &bypass);
+		if (bypass)
+			continue;
 
 		rcu_read_unlock();
 
@@ -5658,29 +5918,6 @@ static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc
 
 #endif
 
-static void set_initial_priority(struct pglist_data *pgdat, struct scan_control *sc)
-{
-	int priority;
-	unsigned long reclaimable;
-	struct lruvec *lruvec = mem_cgroup_lruvec(NULL, pgdat);
-
-	if (sc->priority != DEF_PRIORITY || sc->nr_to_reclaim < MIN_LRU_BATCH)
-		return;
-	/*
-	 * Determine the initial priority based on
-	 * (total >> priority) * reclaimed_to_scanned_ratio = nr_to_reclaim,
-	 * where reclaimed_to_scanned_ratio = inactive / total.
-	 */
-	reclaimable = node_page_state(pgdat, NR_INACTIVE_FILE);
-	if (get_swappiness(lruvec, sc))
-		reclaimable += node_page_state(pgdat, NR_INACTIVE_ANON);
-
-	/* round down reclaimable and round up sc->nr_to_reclaim */
-	priority = fls_long(reclaimable) - 1 - fls_long(sc->nr_to_reclaim - 1);
-
-	sc->priority = clamp(priority, 0, DEF_PRIORITY);
-}
-
 static void lru_gen_shrink_node(struct pglist_data *pgdat, struct scan_control *sc)
 {
 	struct blk_plug plug;
@@ -5719,8 +5956,8 @@ static void lru_gen_shrink_node(struct pglist_data *pgdat, struct scan_control *
 
 	blk_finish_plug(&plug);
 done:
-	/* kswapd should never fail */
-	pgdat->kswapd_failures = 0;
+	if (sc->nr_reclaimed > reclaimed)
+		pgdat->kswapd_failures = 0;
 }
 
 /******************************************************************************
@@ -6407,6 +6644,7 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 	unsigned long nr_to_reclaim = sc->nr_to_reclaim;
 	bool proportional_reclaim;
 	struct blk_plug plug;
+	bool bypass = false;
 
 	if (lru_gen_enabled() && !root_reclaim(sc)) {
 		lru_gen_shrink_lruvec(lruvec, sc);
@@ -6504,6 +6742,9 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 	}
 	blk_finish_plug(&plug);
 	sc->nr_reclaimed += nr_reclaimed;
+	trace_android_vh_rebalance_anon_lru_bypass(&bypass);
+	if (bypass)
+		return;
 
 	/*
 	 * Even if we did not try to evict anon pages at all, we want to
@@ -6603,6 +6844,7 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 		struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
 		unsigned long reclaimed;
 		unsigned long scanned;
+		bool skip = false;
 
 		/*
 		 * This loop can become CPU-bound when target memcgs
@@ -6611,6 +6853,10 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 		 * memory is explicitly protected. Avoid soft lockups.
 		 */
 		cond_resched();
+
+		trace_android_vh_shrink_node_memcgs(memcg, &skip);
+		if (skip)
+			continue;
 
 		mem_cgroup_calculate_protection(target_memcg, memcg);
 
@@ -6657,7 +6903,9 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 	struct lruvec *target_lruvec;
 	bool reclaimable = false;
 
+	trace_android_vh_shrink_node(pgdat, sc->target_mem_cgroup);
 	if (lru_gen_enabled() && root_reclaim(sc)) {
+		memset(&sc->nr, 0, sizeof(sc->nr));
 		lru_gen_shrink_node(pgdat, sc);
 		return;
 	}
@@ -6671,6 +6919,8 @@ again:
 	nr_scanned = sc->nr_scanned;
 
 	prepare_scan_count(pgdat, sc);
+
+	prepare_workingset_protection(pgdat, sc);
 
 	shrink_node_memcgs(pgdat, sc);
 
@@ -7120,6 +7370,7 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
 	struct zoneref *z;
 	struct zone *zone;
 	pg_data_t *pgdat = NULL;
+	bool bypass = false;
 
 	/*
 	 * Kernel threads should not be throttled as they may be indirectly
@@ -7168,6 +7419,10 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
 	if (!pgdat)
 		goto out;
 
+	trace_android_vh_throttle_direct_reclaim_bypass(&bypass);
+	if (bypass)
+		goto out;
+
 	/* Account for the throttling */
 	count_vm_event(PGSCAN_DIRECT_THROTTLE);
 
@@ -7209,6 +7464,8 @@ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 		.may_unmap = 1,
 		.may_swap = 1,
 	};
+	bool skip_swap = false;
+	int prio = 0;
 
 	/*
 	 * scan_control uses s8 fields for order, priority, and reclaim_idx.
@@ -7226,11 +7483,16 @@ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 	if (throttle_direct_reclaim(sc.gfp_mask, zonelist, nodemask))
 		return 1;
 
+	trace_android_vh_tune_scan_control(&skip_swap);
+	if (skip_swap)
+		sc.may_swap = 0;
 	set_task_reclaim_state(current, &sc.reclaim_state);
 	trace_mm_vmscan_direct_reclaim_begin(order, sc.gfp_mask);
+	trace_android_vh_direct_reclaim_begin(&prio);
 
 	nr_reclaimed = do_try_to_free_pages(zonelist, &sc);
 
+	trace_android_vh_direct_reclaim_end(prio);
 	trace_mm_vmscan_direct_reclaim_end(nr_reclaimed);
 	set_task_reclaim_state(current, NULL);
 
@@ -7378,7 +7640,14 @@ static bool pgdat_balanced(pg_data_t *pgdat, int order, int highest_zoneidx)
 {
 	int i;
 	unsigned long mark = -1;
+	bool customized = false;
+	bool balanced = false;
 	struct zone *zone;
+
+	trace_android_vh_mm_customize_pgdat_balanced(order, highest_zoneidx,
+						     &balanced, &customized);
+	if (customized)
+		return balanced;
 
 	/*
 	 * Check watermarks bottom-up as lower zones are more likely to
@@ -7470,6 +7739,7 @@ static bool kswapd_shrink_node(pg_data_t *pgdat,
 {
 	struct zone *zone;
 	int z;
+	unsigned long nr_reclaimed = sc->nr_reclaimed;
 
 	/* Reclaim a number of pages proportional to the number of zones */
 	sc->nr_to_reclaim = 0;
@@ -7480,6 +7750,7 @@ static bool kswapd_shrink_node(pg_data_t *pgdat,
 
 		sc->nr_to_reclaim += max(high_wmark_pages(zone), SWAP_CLUSTER_MAX);
 	}
+	trace_android_rvh_kswapd_shrink_node(&sc->nr_to_reclaim);
 
 	/*
 	 * Historically care was taken to put equal pressure on all zones but
@@ -7497,7 +7768,8 @@ static bool kswapd_shrink_node(pg_data_t *pgdat,
 	if (sc->order && sc->nr_reclaimed >= compact_gap(sc->order))
 		sc->order = 0;
 
-	return sc->nr_scanned >= sc->nr_to_reclaim;
+	/* account for progress from mm_account_reclaimed_pages() */
+	return max(sc->nr_scanned, sc->nr_reclaimed - nr_reclaimed) >= sc->nr_to_reclaim;
 }
 
 /* Page allocator PCP high watermark is lowered if reclaim is active. */
@@ -7935,8 +8207,12 @@ kswapd_try_sleep:
 		 */
 		trace_mm_vmscan_kswapd_wake(pgdat->node_id, highest_zoneidx,
 						alloc_order);
+		trace_android_rvh_vmscan_kswapd_wake(pgdat->node_id, highest_zoneidx,
+						alloc_order);
 		reclaim_order = balance_pgdat(pgdat, alloc_order,
 						highest_zoneidx);
+		trace_android_rvh_vmscan_kswapd_done(pgdat->node_id, highest_zoneidx,
+						alloc_order, reclaim_order);
 		trace_android_vh_vmscan_kswapd_done(pgdat->node_id, highest_zoneidx,
 			       			alloc_order, reclaim_order);
 		if (reclaim_order < alloc_order)
@@ -8044,6 +8320,58 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
 #endif /* CONFIG_HIBERNATION */
 
 /*
+ * kcompress_init_for_node() - Initialize kcompress for a NUMA node
+ * @pgdat: The pg_data_t structure for the node
+ * @nid: Node ID
+ *
+ * This function initializes kcompress structures after the system
+ * is fully initialized, following Linux kernel best practices.
+ */
+static int kcompress_init_for_node(pg_data_t *pgdat, int nid)
+{
+	/* Already initialized or disabled */
+	if (pgdat->kcompress)
+		return 0;
+
+	pgdat->kcompress = kzalloc(sizeof(struct kcompress_data), GFP_KERNEL);
+	if (!pgdat->kcompress) {
+		pr_warn("Failed to allocate kcompress_data for node %d\n", nid);
+		return -ENOMEM;
+	}
+
+	/* Initialize synchronization primitives */
+	init_waitqueue_head(&pgdat->kcompress->kcompressd_wait);
+	spin_lock_init(&pgdat->kcompress->kcompress_fifo_lock);
+	pgdat->kcompress->kcompressd = NULL;
+	
+	/* Allocate FIFO structure */
+	pgdat->kcompress->kcompress_fifo = kzalloc(sizeof(struct kfifo), GFP_KERNEL);
+	if (!pgdat->kcompress->kcompress_fifo) {
+		pr_warn("Failed to allocate kcompress_fifo for node %d\n", nid);
+		goto cleanup_kcompress;
+	}
+
+	/* Initialize the FIFO with proper size */
+	if (kfifo_alloc(pgdat->kcompress->kcompress_fifo,
+			KCOMPRESS_FIFO_SIZE * sizeof(struct folio *),
+			GFP_KERNEL)) {
+		pr_warn("Failed to initialize kcompress_fifo for node %d\n", nid);
+		goto cleanup_fifo_struct;
+	}
+	
+	return 0;
+
+cleanup_fifo_struct:
+	kfree(pgdat->kcompress->kcompress_fifo);
+	pgdat->kcompress->kcompress_fifo = NULL;
+cleanup_kcompress:
+	kfree(pgdat->kcompress);
+	pgdat->kcompress = NULL;
+	pr_info("kcompressd disabled for node %d due to initialization failure\n", nid);
+	return -ENOMEM;
+}
+
+/*
  * This kswapd start function will be called by init and node-hot-add.
  */
 void __meminit kswapd_run(int nid)
@@ -8054,13 +8382,95 @@ void __meminit kswapd_run(int nid)
 	if (!pgdat->kswapd) {
 		pgdat->kswapd = kthread_run(kswapd, pgdat, "kswapd%d", nid);
 		if (IS_ERR(pgdat->kswapd)) {
-			/* failure at boot is fatal */
+			/* Failure at boot is fatal */
 			BUG_ON(system_state < SYSTEM_RUNNING);
 			pr_err("Failed to start kswapd on node %d\n", nid);
 			pgdat->kswapd = NULL;
+			goto out;
 		}
+
+		/* 
+		 * Initialize kcompress now that the system is fully running
+		 * This follows the kernel pattern of delayed initialization
+		 */
+		if (kcompress_init_for_node(pgdat, nid) == 0) {
+			/* Only create kcompressd if initialization succeeded */
+			pgdat->kcompress->kcompressd = kthread_create_on_node(
+				kcompressd, pgdat, nid, "kcompressd%d", nid);
+
+			printk(KERN_INFO "Kcompressd-Unofficial 0.5 by Masahito Suzuki (forked from Kcompressd by Qun-Wei Lin from MediaTek)\n");
+
+ 			if (IS_ERR(pgdat->kcompress->kcompressd)) {
+				pr_warn("Failed to start kcompressd on node %d: %ld\n",
+ 				       nid, PTR_ERR(pgdat->kcompress->kcompressd));
+ 				pgdat->kcompress->kcompressd = NULL;
+				/* kswapd continues without kcompressd */
+ 			} else {
+				pr_info("kcompressd started successfully on node %d\n", nid);
+ 				wake_up_process(pgdat->kcompress->kcompressd);
+ 			}
+		} else {
+			pr_info("kcompressd disabled on node %d\n", nid);
+ 		}
 	}
+ 
+ out:
 	pgdat_kswapd_unlock(pgdat);
+}
+
+/*
+ * kcompress_cleanup() - Clean up kcompress resources for a node
+ * @pgdat: The pg_data_t structure for the node
+ *
+ * This function safely cleans up all kcompress-related resources,
+ * ensuring proper shutdown of the kcompressd thread and deallocation
+ * of memory structures.
+ */
+static void kcompress_cleanup(pg_data_t *pgdat)
+{
+	if (!pgdat || !pgdat->kcompress)
+		return;
+
+	/* Stop kcompressd thread if it exists */
+	if (pgdat->kcompress->kcompressd) {
+		kthread_stop(pgdat->kcompress->kcompressd);
+		pgdat->kcompress->kcompressd = NULL;
+	}
+
+	/* Process any remaining folios in the FIFO before cleanup */
+	if (pgdat->kcompress->kcompress_fifo) {
+		struct folio *folio;
+		
+		/* Drain the FIFO and process remaining folios synchronously */
+		while (kfifo_out_locked(pgdat->kcompress->kcompress_fifo,
+					&folio, sizeof(folio), 
+					&pgdat->kcompress->kcompress_fifo_lock)) {
+			/* Process the folio synchronously before cleanup */
+			if (zswap_store(folio)) {
+				count_mthp_stat(folio_order(folio), MTHP_STAT_ZSWPOUT);
+				folio_unlock(folio);
+			} else {
+				struct writeback_control wbc = {
+					.sync_mode = WB_SYNC_NONE,
+					.nr_to_write = SWAP_CLUSTER_MAX,
+					.range_start = 0,
+					.range_end = LLONG_MAX,
+					.for_reclaim = 1,
+				};
+				__swap_writepage(&folio->page, &wbc);
+			}
+			folio_put(folio);
+		}
+
+		/* Free FIFO resources */
+		kfifo_free(pgdat->kcompress->kcompress_fifo);
+		kfree(pgdat->kcompress->kcompress_fifo);
+		pgdat->kcompress->kcompress_fifo = NULL;
+	}
+
+	/* Free the main kcompress structure */
+	kfree(pgdat->kcompress);
+	pgdat->kcompress = NULL;
 }
 
 /*
@@ -8078,6 +8488,10 @@ void __meminit kswapd_stop(int nid)
 		kthread_stop(kswapd);
 		pgdat->kswapd = NULL;
 	}
+	
+	/* Clean up kcompress resources */
+	kcompress_cleanup(pgdat);
+	
 	pgdat_kswapd_unlock(pgdat);
 }
 
@@ -8255,7 +8669,7 @@ int node_reclaim(struct pglist_data *pgdat, gfp_t gfp_mask, unsigned int order)
 		return NODE_RECLAIM_NOSCAN;
 
 	ret = __node_reclaim(pgdat, gfp_mask, order);
-	clear_bit(PGDAT_RECLAIM_LOCKED, &pgdat->flags);
+	clear_bit_unlock(PGDAT_RECLAIM_LOCKED, &pgdat->flags);
 
 	if (!ret)
 		count_vm_event(PGSCAN_ZONE_RECLAIM_FAILED);

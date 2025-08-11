@@ -130,8 +130,8 @@ void __noreturn __hyp_do_panic(struct kvm_cpu_context *host_ctxt, u64 spsr,
 #endif
 
 #ifdef __KVM_NVHE_HYPERVISOR__
-void __pkvm_init_switch_pgd(struct kvm_nvhe_init_params *params,
-			    void (*finalize_fn)(void));
+void __pkvm_init_switch_pgd(phys_addr_t pgd, unsigned long sp,
+		void (*fn)(void));
 int __pkvm_init(phys_addr_t phys, unsigned long size, unsigned long nr_cpus,
 		unsigned long *per_cpu_base, u32 hyp_va_bits);
 void __noreturn __host_enter(struct kvm_cpu_context *host_ctxt);
@@ -142,6 +142,9 @@ void __hyp_exit(void);
 #ifdef __KVM_NVHE_HYPERVISOR__
 struct user_fpsimd_state *get_host_fpsimd_state(struct kvm_vcpu *vcpu);
 struct kvm_host_sve_state *get_host_sve_state(struct kvm_vcpu *vcpu);
+#else
+#define get_host_fpsimd_state(vcpu) NULL
+#define get_host_sve_state(vcpu) NULL
 #endif
 
 extern u64 kvm_nvhe_sym(id_aa64pfr0_el1_sys_val);

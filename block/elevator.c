@@ -558,7 +558,7 @@ EXPORT_SYMBOL_GPL(elv_unregister);
 static inline bool elv_support_iosched(struct request_queue *q)
 {
 	if (!queue_is_mq(q) ||
-	    (q->tag_set && (q->tag_set->flags & BLK_MQ_F_NO_SCHED)))
+	    (q->tag_set->flags & BLK_MQ_F_NO_SCHED))
 		return false;
 	return true;
 }
@@ -569,14 +569,19 @@ static inline bool elv_support_iosched(struct request_queue *q)
  */
 static struct elevator_type *elevator_get_default(struct request_queue *q)
 {
-	if (q->tag_set && q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
+	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
 		return NULL;
+
+#ifdef CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
+	return elevator_find_get(q, "adios");
+#else // !CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
 
 	if (q->nr_hw_queues != 1 &&
 	    !blk_mq_is_shared_tags(q->tag_set->flags))
 		return NULL;
 
 	return elevator_find_get(q, "mq-deadline");
+#endif // CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
 }
 
 /*

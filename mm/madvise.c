@@ -45,32 +45,21 @@
 struct madvise_walk_private {
 	struct mmu_gather *tlb;
 	bool pageout;
+	void *private;
 };
 
-/*
- * Any behaviour which results in changes to the vma->vm_flags needs to
- * take mmap_lock for writing. Others, which simply traverse vmas, need
- * to only take it for reading.
- */
-static int madvise_need_mmap_write(int behavior)
-{
-	switch (behavior) {
-	case MADV_REMOVE:
-	case MADV_WILLNEED:
-	case MADV_DONTNEED:
-	case MADV_DONTNEED_LOCKED:
-	case MADV_COLD:
-	case MADV_PAGEOUT:
-	case MADV_FREE:
-	case MADV_POPULATE_READ:
-	case MADV_POPULATE_WRITE:
-	case MADV_COLLAPSE:
-		return 0;
-	default:
-		/* be safe, default to 1. list exceptions explicitly */
-		return 1;
-	}
-}
+enum madvise_lock_mode {
+	MADVISE_NO_LOCK,
+	MADVISE_MMAP_READ_LOCK,
+	MADVISE_MMAP_WRITE_LOCK,
+	MADVISE_VMA_READ_LOCK,
+};
+
+struct madvise_behavior {
+	int behavior;
+	struct mmu_gather *tlb;
+	enum madvise_lock_mode lock_mode;
+};
 
 #ifdef CONFIG_ANON_VMA_NAME
 struct anon_vma_name *anon_vma_name_alloc(const char *name)
@@ -186,6 +175,7 @@ success:
 		error = replace_anon_vma_name(vma, anon_name);
 		if (error)
 			return error;
+		trace_android_vh_replace_anon_vma_name(vma, anon_name);
 	}
 
 	return 0;
@@ -372,10 +362,18 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
 	struct folio *folio = NULL;
 	LIST_HEAD(folio_list);
 	bool pageout_anon_only_filter;
+	bool abort_madvise = false;
 	int nr;
+	swp_entry_t entry;
+	int ret = 0;
 
-	if (fatal_signal_pending(current))
+	trace_android_vh_madvise_cold_or_pageout_abort(vma, &abort_madvise);
+	if (fatal_signal_pending(current) || abort_madvise)
 		return -EINTR;
+
+	trace_android_vh_madvise_pageout_bypass(mm, pageout, &ret);
+	if (ret)
+		return ret;
 
 	pageout_anon_only_filter = pageout && !vma_is_anonymous(vma) &&
 					!can_do_file_pageout(vma);
@@ -447,7 +445,7 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
 huge_unlock:
 		spin_unlock(ptl);
 		if (pageout)
-			reclaim_pages(&folio_list, true);
+			__reclaim_pages(&folio_list, true, private->private);
 		return 0;
 	}
 
@@ -467,8 +465,13 @@ regular_folio:
 		if (pte_none(ptent))
 			continue;
 
-		if (!pte_present(ptent))
+		if (!pte_present(ptent)) {
+			entry = pte_to_swp_entry(ptent);
+			if (!non_swap_entry(entry))
+				trace_android_vh_madvise_pageout_swap_entry(entry,
+					swp_swapcount(entry), NULL);
 			continue;
+		}
 
 		folio = vm_normal_folio(vma, addr, ptent);
 		if (!folio || folio_is_zone_device(folio))
@@ -492,12 +495,17 @@ regular_folio:
 
 			nr = madvise_folio_pte_batch(addr, end, folio, pte,
 						     ptent, &any_young, NULL);
+
 			if (any_young)
 				ptent = pte_mkyoung(ptent);
 
 			if (nr < folio_nr_pages(folio)) {
 				int err;
+				bool bypass = false;
 
+				trace_android_vh_split_large_folio_bypass(&bypass);
+				if (bypass)
+					continue;
 				if (folio_likely_mapped_shared(folio))
 					continue;
 				if (pageout_anon_only_filter && !folio_test_anon(folio))
@@ -567,7 +575,7 @@ regular_folio:
 		pte_unmap_unlock(start_pte, ptl);
 	}
 	if (pageout)
-		reclaim_pages(&folio_list, true);
+		__reclaim_pages(&folio_list, true, private->private);
 	cond_resched();
 
 	return 0;
@@ -616,7 +624,7 @@ static long madvise_cold(struct vm_area_struct *vma,
 	return 0;
 }
 
-static void madvise_pageout_page_range(struct mmu_gather *tlb,
+static int madvise_pageout_page_range(struct mmu_gather *tlb,
 			     struct vm_area_struct *vma,
 			     unsigned long addr, unsigned long end)
 {
@@ -624,10 +632,20 @@ static void madvise_pageout_page_range(struct mmu_gather *tlb,
 		.pageout = true,
 		.tlb = tlb,
 	};
+	int ret;
+	LIST_HEAD(folio_list);
+
+	trace_android_rvh_madvise_pageout_begin(&walk_private.private);
 
 	tlb_start_vma(tlb, vma);
-	walk_page_range(vma->vm_mm, addr, end, &cold_walk_ops, &walk_private);
+	ret = walk_page_range(vma->vm_mm, addr, end, &cold_walk_ops, &walk_private);
 	tlb_end_vma(tlb, vma);
+
+	trace_android_rvh_madvise_pageout_end(walk_private.private, &folio_list);
+	if (!list_empty(&folio_list))
+		reclaim_pages(&folio_list, true);
+
+	return ret;
 }
 
 static long madvise_pageout(struct vm_area_struct *vma,
@@ -636,6 +654,8 @@ static long madvise_pageout(struct vm_area_struct *vma,
 {
 	struct mm_struct *mm = vma->vm_mm;
 	struct mmu_gather tlb;
+	int ret;
+	bool return_error = false;
 
 	*prev = vma;
 	if (!can_madv_lru_vma(vma))
@@ -653,8 +673,12 @@ static long madvise_pageout(struct vm_area_struct *vma,
 
 	lru_add_drain();
 	tlb_gather_mmu(&tlb, mm);
-	madvise_pageout_page_range(&tlb, vma, start_addr, end_addr);
+	ret = madvise_pageout_page_range(&tlb, vma, start_addr, end_addr);
 	tlb_finish_mmu(&tlb);
+
+	trace_android_vh_madvise_pageout_return_error(ret, &return_error);
+	if (return_error)
+		return (long)ret;
 
 	return 0;
 }
@@ -905,8 +929,9 @@ static bool madvise_dontneed_free_valid_vma(struct vm_area_struct *vma,
 static long madvise_dontneed_free(struct vm_area_struct *vma,
 				  struct vm_area_struct **prev,
 				  unsigned long start, unsigned long end,
-				  int behavior)
+				  struct madvise_behavior *madv_behavior)
 {
+	int behavior = madv_behavior->behavior;
 	struct mm_struct *mm = vma->vm_mm;
 
 	*prev = vma;
@@ -945,7 +970,16 @@ static long madvise_dontneed_free(struct vm_area_struct *vma,
 			 */
 			end = vma->vm_end;
 		}
-		VM_WARN_ON(start >= end);
+		/*
+		 * If the memory region between start and end was
+		 * originally backed by 4kB pages and then remapped to
+		 * be backed by hugepages while mmap_lock was dropped,
+		 * the adjustment for hugetlb vma above may have rounded
+		 * end down to the start address.
+		 */
+		if (start == end)
+			return 0;
+		VM_WARN_ON(start > end);
 	}
 
 	if (behavior == MADV_DONTNEED || behavior == MADV_DONTNEED_LOCKED)
@@ -1057,11 +1091,16 @@ static long madvise_remove(struct vm_area_struct *vma,
 static int madvise_vma_behavior(struct vm_area_struct *vma,
 				struct vm_area_struct **prev,
 				unsigned long start, unsigned long end,
-				unsigned long behavior)
+				void *behavior_arg)
 {
+	struct madvise_behavior *arg = behavior_arg;
+	int behavior = arg->behavior;
 	int error;
 	struct anon_vma_name *anon_name;
 	unsigned long new_flags = vma->vm_flags;
+
+	if (unlikely(!can_modify_vma_madv(vma, behavior)))
+		return -EPERM;
 
 	switch (behavior) {
 	case MADV_REMOVE:
@@ -1075,7 +1114,7 @@ static int madvise_vma_behavior(struct vm_area_struct *vma,
 	case MADV_FREE:
 	case MADV_DONTNEED:
 	case MADV_DONTNEED_LOCKED:
-		return madvise_dontneed_free(vma, prev, start, end, behavior);
+		return madvise_dontneed_free(vma, prev, start, end, arg);
 	case MADV_POPULATE_READ:
 	case MADV_POPULATE_WRITE:
 		return madvise_populate(vma, prev, start, end, behavior);
@@ -1251,6 +1290,44 @@ static bool process_madvise_behavior_valid(int behavior)
 }
 
 /*
+ * Try to acquire a VMA read lock if possible.
+ *
+ * We only support this lock over a single VMA, which the input range must
+ * span either partially or fully.
+ *
+ * This function always returns with an appropriate lock held. If a VMA read
+ * lock could be acquired, we return the locked VMA.
+ *
+ * If a VMA read lock could not be acquired, we return NULL and expect caller to
+ * fallback to mmap lock behaviour.
+ */
+static struct vm_area_struct *try_vma_read_lock(struct mm_struct *mm,
+		struct madvise_behavior *madv_behavior,
+		unsigned long start, unsigned long end)
+{
+	struct vm_area_struct *vma;
+
+	vma = lock_vma_under_rcu(mm, start);
+	if (!vma)
+		goto take_mmap_read_lock;
+	/*
+	 * Must span only a single VMA; uffd and remote processes are
+	 * unsupported.
+	 */
+	if (end > vma->vm_end || current->mm != mm ||
+	    userfaultfd_armed(vma)) {
+		vma_end_read(vma);
+		goto take_mmap_read_lock;
+	}
+	return vma;
+
+take_mmap_read_lock:
+	mmap_read_lock(mm);
+	madv_behavior->lock_mode = MADVISE_MMAP_READ_LOCK;
+	return NULL;
+}
+
+/*
  * Walk the vmas in range [start,end), and call the visit function on each one.
  * The visit function will get start and end parameters that cover the overlap
  * between the current vma and the original range.  Any unmapped regions in the
@@ -1260,15 +1337,30 @@ static bool process_madvise_behavior_valid(int behavior)
  */
 static
 int madvise_walk_vmas(struct mm_struct *mm, unsigned long start,
-		      unsigned long end, unsigned long arg,
+		      unsigned long end, struct madvise_behavior *madv_behavior,
+		      void *arg,
 		      int (*visit)(struct vm_area_struct *vma,
 				   struct vm_area_struct **prev, unsigned long start,
-				   unsigned long end, unsigned long arg))
+				   unsigned long end, void *arg))
 {
 	struct vm_area_struct *vma;
 	struct vm_area_struct *prev;
 	unsigned long tmp;
 	int unmapped_error = 0;
+	int error;
+
+	/*
+	 * If VMA read lock is supported, apply madvise to a single VMA
+	 * tentatively, avoiding walking VMAs.
+	 */
+	if (madv_behavior && madv_behavior->lock_mode == MADVISE_VMA_READ_LOCK) {
+		vma = try_vma_read_lock(mm, madv_behavior, start, end);
+		if (vma) {
+			error = visit(vma, &prev, start, end, arg);
+			vma_end_read(vma);
+			return error;
+		}
+	}
 
 	/*
 	 * If the interval [start,end) covers some unmapped address
@@ -1280,8 +1372,6 @@ int madvise_walk_vmas(struct mm_struct *mm, unsigned long start,
 		prev = vma;
 
 	for (;;) {
-		int error;
-
 		/* Still start < end. */
 		if (!vma)
 			return -ENOMEM;
@@ -1321,7 +1411,7 @@ int madvise_walk_vmas(struct mm_struct *mm, unsigned long start,
 static int madvise_vma_anon_name(struct vm_area_struct *vma,
 				 struct vm_area_struct **prev,
 				 unsigned long start, unsigned long end,
-				 unsigned long anon_name)
+				 void *anon_name)
 {
 	int error;
 
@@ -1331,7 +1421,7 @@ static int madvise_vma_anon_name(struct vm_area_struct *vma,
 
 	trace_android_vh_update_vma_flags(vma);
 	error = madvise_update_vma(vma, prev, start, end, vma->vm_flags,
-				   (struct anon_vma_name *)anon_name);
+				   anon_name);
 
 	/*
 	 * madvise() returns EAGAIN if kernel resources, such as
@@ -1363,10 +1453,118 @@ int madvise_set_anon_name(struct mm_struct *mm, unsigned long start,
 	if (end == start)
 		return 0;
 
-	return madvise_walk_vmas(mm, start, end, (unsigned long)anon_name,
+	return madvise_walk_vmas(mm, start, end, NULL, anon_name,
 				 madvise_vma_anon_name);
 }
 #endif /* CONFIG_ANON_VMA_NAME */
+
+#ifdef CONFIG_MEMORY_FAILURE
+static bool is_memory_failure(int behavior)
+{
+	switch (behavior) {
+	case MADV_HWPOISON:
+	case MADV_SOFT_OFFLINE:
+		return true;
+	default:
+		return false;
+	}
+}
+#else
+static bool is_memory_failure(int behavior)
+{
+	return false;
+}
+#endif
+
+/*
+ * Any behaviour which results in changes to the vma->vm_flags needs to
+ * take mmap_lock for writing. Others, which simply traverse vmas, need
+ * to only take it for reading.
+ */
+static enum madvise_lock_mode get_lock_mode(struct madvise_behavior *madv_behavior)
+{
+	int behavior = madv_behavior->behavior;
+
+	if (is_memory_failure(behavior))
+		return MADVISE_NO_LOCK;
+
+	switch (behavior) {
+	case MADV_REMOVE:
+	case MADV_WILLNEED:
+	case MADV_COLD:
+	case MADV_PAGEOUT:
+	case MADV_FREE:
+	case MADV_POPULATE_READ:
+	case MADV_POPULATE_WRITE:
+	case MADV_COLLAPSE:
+		return MADVISE_MMAP_READ_LOCK;
+	case MADV_DONTNEED:
+	case MADV_DONTNEED_LOCKED:
+		return MADVISE_VMA_READ_LOCK;
+	default:
+		return MADVISE_MMAP_WRITE_LOCK;
+	}
+}
+
+static int madvise_lock(struct mm_struct *mm,
+		struct madvise_behavior *madv_behavior)
+{
+	enum madvise_lock_mode lock_mode = get_lock_mode(madv_behavior);
+
+	switch (lock_mode) {
+	case MADVISE_NO_LOCK:
+		break;
+	case MADVISE_MMAP_WRITE_LOCK:
+		if (mmap_write_lock_killable(mm))
+			return -EINTR;
+		break;
+	case MADVISE_MMAP_READ_LOCK:
+		mmap_read_lock(mm);
+		break;
+	case MADVISE_VMA_READ_LOCK:
+		/* We will acquire the lock per-VMA in madvise_walk_vmas(). */
+		break;
+	}
+
+	madv_behavior->lock_mode = lock_mode;
+	return 0;
+}
+
+static void madvise_unlock(struct mm_struct *mm,
+		struct madvise_behavior *madv_behavior)
+{
+	switch (madv_behavior->lock_mode) {
+	case  MADVISE_NO_LOCK:
+		return;
+	case MADVISE_MMAP_WRITE_LOCK:
+		mmap_write_unlock(mm);
+		break;
+	case MADVISE_MMAP_READ_LOCK:
+		mmap_read_unlock(mm);
+		break;
+	case MADVISE_VMA_READ_LOCK:
+		/* We will drop the lock per-VMA in madvise_walk_vmas(). */
+		break;
+	}
+
+	madv_behavior->lock_mode = MADVISE_NO_LOCK;
+}
+
+/*
+ * untagged_addr_remote() assumes mmap_lock is already held. On
+ * architectures like x86 and RISC-V, tagging is tricky because each
+ * mm may have a different tagging mask. However, we might only hold
+ * the per-VMA lock (currently only local processes are supported),
+ * so untagged_addr is used to avoid the mmap_lock assertion for
+ * local processes.
+ */
+static inline unsigned long get_untagged_addr(struct mm_struct *mm,
+		unsigned long start)
+{
+	return current->mm == mm ? untagged_addr(start) :
+				   untagged_addr_remote(mm, start);
+}
+
 /*
  * The madvise(2) system call.
  *
@@ -1437,14 +1635,15 @@ int madvise_set_anon_name(struct mm_struct *mm, unsigned long start,
  *  -EIO    - an I/O error occurred while paging in data.
  *  -EBADF  - map exists, but area maps something that isn't a file.
  *  -EAGAIN - a kernel resource was temporarily unavailable.
+ *  -EPERM  - memory is sealed.
  */
 int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int behavior)
 {
 	unsigned long end;
 	int error;
-	int write;
 	size_t len;
 	struct blk_plug plug;
+	struct madvise_behavior madv_behavior = {.behavior = behavior};
 
 	if (!madvise_behavior_valid(behavior))
 		return -EINVAL;
@@ -1464,36 +1663,38 @@ int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int beh
 	if (end == start)
 		return 0;
 
+	error = madvise_lock(mm, &madv_behavior);
+	if (error)
+		return error;
+
 #ifdef CONFIG_MEMORY_FAILURE
 	if (behavior == MADV_HWPOISON || behavior == MADV_SOFT_OFFLINE)
 		return madvise_inject_error(behavior, start, start + len_in);
 #endif
 
-	write = madvise_need_mmap_write(behavior);
-	if (write) {
-		if (mmap_write_lock_killable(mm))
-			return -EINTR;
-	} else {
-		mmap_read_lock(mm);
-	}
-
-	start = untagged_addr_remote(mm, start);
+	start = get_untagged_addr(mm, start);
 	end = start + len;
 
 	blk_start_plug(&plug);
-	error = madvise_walk_vmas(mm, start, end, behavior,
-			madvise_vma_behavior);
+	error = madvise_walk_vmas(mm, start, end, &madv_behavior,
+			&madv_behavior, madvise_vma_behavior);
 	blk_finish_plug(&plug);
-	if (write)
-		mmap_write_unlock(mm);
-	else
-		mmap_read_unlock(mm);
+
+	madvise_unlock(mm, &madv_behavior);
 
 	return error;
 }
 
 SYSCALL_DEFINE3(madvise, unsigned long, start, size_t, len_in, int, behavior)
 {
+	bool bypass = false;
+	int ret;
+
+	trace_android_rvh_do_madvise_bypass(current->mm, start,
+			len_in, behavior, &ret, &bypass);
+	if (bypass)
+		return ret;
+
 	return do_madvise(current->mm, start, len_in, behavior);
 }
 
@@ -1508,6 +1709,13 @@ SYSCALL_DEFINE5(process_madvise, int, pidfd, const struct iovec __user *, vec,
 	struct mm_struct *mm;
 	size_t total_len;
 	unsigned int f_flags;
+	bool bypass = false;
+	bool return_error = false;
+
+	trace_android_rvh_process_madvise_bypass(pidfd, vec,
+			vlen, behavior, flags, &ret, &bypass);
+	if (bypass)
+		return ret;
 
 	if (flags != 0) {
 		ret = -EINVAL;
@@ -1546,14 +1754,21 @@ SYSCALL_DEFINE5(process_madvise, int, pidfd, const struct iovec __user *, vec,
 	}
 
 	total_len = iov_iter_count(&iter);
+	trace_android_vh_process_madvise_begin(task, behavior);
 
 	while (iov_iter_count(&iter)) {
+		trace_android_vh_process_madvise_iter(task, behavior, &ret);
+		if (ret < 0)
+			break;
 		ret = do_madvise(mm, (unsigned long)iter_iov_addr(&iter),
 					iter_iov_len(&iter), behavior);
 		if (ret < 0)
 			break;
 		iov_iter_advance(&iter, iter_iov_len(&iter));
 	}
+	trace_android_vh_process_madvise_return_error(behavior, ret, &return_error);
+	if (return_error)
+		goto release_mm;
 
 	ret = (total_len - iov_iter_count(&iter)) ? : ret;
 

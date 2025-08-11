@@ -33,8 +33,29 @@
 #include <linux/debugfs.h>
 #include <linux/cpuhotplug.h>
 #include <linux/part_stat.h>
+#include <linux/mm.h>
+#include <linux/kthread.h>
+
+#ifdef CONFIG_ZRAM_AUTO_SIZE
+#include <linux/math64.h>
+#include <linux/cpu.h>
+#include <linux/reciprocal_div.h>
+#include <linux/minmax.h>
+#include <linux/intfp.h>
+
+#ifndef FP_BITS
+#define FP_BITS 16
+#endif
+
+#endif
 
 #include "zram_drv.h"
+
+#define CHECK_INTERVAL (30 * HZ) // 每30秒检查一次
+#define ZRAM_THRESHOLD 30 // zram占用率阈值30%
+#define MEM_THRESHOLD 80 // 内存占用率阈值80%
+
+static struct task_struct *monitor_thread;
 
 static DEFINE_IDR(zram_index_idr);
 /* idr index must be protected */
@@ -174,6 +195,14 @@ static inline u32 zram_get_priority(struct zram *zram, u32 index)
 	return prio & ZRAM_COMP_PRIORITY_MASK;
 }
 
+static void zram_accessed(struct zram *zram, u32 index)
+{
+	zram_clear_flag(zram, index, ZRAM_IDLE);
+#ifdef CONFIG_ZRAM_TRACK_ENTRY_ACTIME
+	zram->table[index].ac_time = ktime_get_boottime();
+#endif
+}
+
 static inline void update_used_max(struct zram *zram,
 					const unsigned long pages)
 {
@@ -289,16 +318,30 @@ static void mark_idle(struct zram *zram, ktime_t cutoff)
 		/*
 		 * Do not mark ZRAM_UNDER_WB slot as ZRAM_IDLE to close race.
 		 * See the comment in writeback_store.
+		 *
+		 * Also do not mark ZRAM_SAME slots as ZRAM_IDLE, because no
+		 * post-processing (recompress, writeback) happens to the
+		 * ZRAM_SAME slot.
+		 *
+		 * And ZRAM_WB slots simply cannot be ZRAM_IDLE.
 		 */
 		zram_slot_lock(zram, index);
-		if (zram_allocated(zram, index) &&
-				!zram_test_flag(zram, index, ZRAM_UNDER_WB)) {
-#ifdef CONFIG_ZRAM_MEMORY_TRACKING
-			is_idle = !cutoff || ktime_after(cutoff, zram->table[index].ac_time);
-#endif
-			if (is_idle)
-				zram_set_flag(zram, index, ZRAM_IDLE);
+		if (!zram_allocated(zram, index) ||
+		    zram_test_flag(zram, index, ZRAM_WB) ||
+		    zram_test_flag(zram, index, ZRAM_UNDER_WB) ||
+		    zram_test_flag(zram, index, ZRAM_SAME)) {
+			zram_slot_unlock(zram, index);
+			continue;
 		}
+
+#ifdef CONFIG_ZRAM_TRACK_ENTRY_ACTIME
+		is_idle = !cutoff ||
+			ktime_after(cutoff, zram->table[index].ac_time);
+#endif
+		if (is_idle)
+			zram_set_flag(zram, index, ZRAM_IDLE);
+		else
+			zram_clear_flag(zram, index, ZRAM_IDLE);
 		zram_slot_unlock(zram, index);
 	}
 }
@@ -317,7 +360,7 @@ static ssize_t idle_store(struct device *dev,
 		 */
 		u64 age_sec;
 
-		if (IS_ENABLED(CONFIG_ZRAM_MEMORY_TRACKING) && !kstrtoull(buf, 0, &age_sec))
+		if (IS_ENABLED(CONFIG_ZRAM_TRACK_ENTRY_ACTIME) && !kstrtoull(buf, 0, &age_sec))
 			cutoff_time = ktime_sub(ktime_get_boottime(),
 					ns_to_ktime(age_sec * NSEC_PER_SEC));
 		else
@@ -516,6 +559,12 @@ static ssize_t backing_dev_store(struct device *dev,
 	}
 
 	nr_pages = i_size_read(inode) >> PAGE_SHIFT;
+	/* Refuse to use zero sized device (also prevents self reference) */
+	if (!nr_pages) {
+		err = -EINVAL;
+		goto out;
+	}
+
 	bitmap_sz = BITS_TO_LONGS(nr_pages) * sizeof(long);
 	bitmap = kvzalloc(bitmap_sz, GFP_KERNEL);
 	if (!bitmap) {
@@ -844,12 +893,6 @@ static void zram_debugfs_destroy(void)
 	debugfs_remove_recursive(zram_debugfs_root);
 }
 
-static void zram_accessed(struct zram *zram, u32 index)
-{
-	zram_clear_flag(zram, index, ZRAM_IDLE);
-	zram->table[index].ac_time = ktime_get_boottime();
-}
-
 static ssize_t read_block_state(struct file *file, char __user *buf,
 				size_t count, loff_t *ppos)
 {
@@ -933,10 +976,6 @@ static void zram_debugfs_unregister(struct zram *zram)
 #else
 static void zram_debugfs_create(void) {};
 static void zram_debugfs_destroy(void) {};
-static void zram_accessed(struct zram *zram, u32 index)
-{
-	zram_clear_flag(zram, index, ZRAM_IDLE);
-};
 static void zram_debugfs_register(struct zram *zram) {};
 static void zram_debugfs_unregister(struct zram *zram) {};
 #endif
@@ -1220,12 +1259,16 @@ static void zram_meta_free(struct zram *zram, u64 disksize)
 	size_t num_pages = disksize >> PAGE_SHIFT;
 	size_t index;
 
+	if (!zram->table)
+		return;
+
 	/* Free all pages that are still in this zram device */
 	for (index = 0; index < num_pages; index++)
 		zram_free_page(zram, index);
 
 	zs_destroy_pool(zram->mem_pool);
 	vfree(zram->table);
+	zram->table = NULL;
 }
 
 static bool zram_meta_alloc(struct zram *zram, u64 disksize)
@@ -1240,6 +1283,7 @@ static bool zram_meta_alloc(struct zram *zram, u64 disksize)
 	zram->mem_pool = zs_create_pool(zram->disk->disk_name);
 	if (!zram->mem_pool) {
 		vfree(zram->table);
+		zram->table = NULL;
 		return false;
 	}
 
@@ -1257,7 +1301,7 @@ static void zram_free_page(struct zram *zram, size_t index)
 {
 	unsigned long handle;
 
-#ifdef CONFIG_ZRAM_MEMORY_TRACKING
+#ifdef CONFIG_ZRAM_TRACK_ENTRY_ACTIME
 	zram->table[index].ac_time = 0;
 #endif
 	if (zram_test_flag(zram, index, ZRAM_IDLE))
@@ -1341,7 +1385,7 @@ static int zram_read_from_zspool(struct zram *zram, struct page *page,
 	src = zs_map_object(zram->mem_pool, handle, ZS_MM_RO);
 	if (size == PAGE_SIZE) {
 		dst = kmap_atomic(page);
-		memcpy(dst, src, PAGE_SIZE);
+		copy_page(dst, src);
 		kunmap_atomic(dst);
 		ret = 0;
 	} else {
@@ -1600,6 +1644,13 @@ static int zram_recompress(struct zram *zram, u32 index, struct page *page,
 	ret = zram_read_from_zspool(zram, page, index);
 	if (ret)
 		return ret;
+
+	/*
+	 * We touched this entry so mark it as non-IDLE. This makes sure that
+	 * we don't preserve IDLE flag and don't incorrectly pick this entry
+	 * for different post-processing type (e.g. writeback).
+	 */
+	zram_clear_flag(zram, index, ZRAM_IDLE);
 
 	class_index_old = zs_lookup_class_index(zram->mem_pool, comp_len_old);
 	/*
@@ -1984,6 +2035,13 @@ static void zram_destroy_comps(struct zram *zram)
 		zcomp_destroy(comp);
 		zram->num_active_comps--;
 	}
+
+	for (prio = ZRAM_PRIMARY_COMP; prio < ZRAM_MAX_COMPS; prio++) {
+		/* Do not free statically defined compression algorithms */
+		if (zram->comp_algs[prio] != default_compressor)
+			kfree(zram->comp_algs[prio]);
+		zram->comp_algs[prio] = NULL;
+	}
 }
 
 static void zram_reset_device(struct zram *zram)
@@ -1991,11 +2049,6 @@ static void zram_reset_device(struct zram *zram)
 	down_write(&zram->init_lock);
 
 	zram->limit_pages = 0;
-
-	if (!init_done(zram)) {
-		up_write(&zram->init_lock);
-		return;
-	}
 
 	set_capacity_and_notify(zram->disk, 0);
 	part_stat_set_all(zram->disk->part0, 0);
@@ -2011,6 +2064,65 @@ static void zram_reset_device(struct zram *zram)
 	up_write(&zram->init_lock);
 }
 
+static inline u64 _round_up(u64 num, u64 multiple) {
+    if (multiple == 0) return num;
+    u64 remainder = num % multiple;
+    if (remainder == 0) return num;
+    return num + multiple - remainder;
+}
+
+#ifdef CONFIG_ZRAM_AUTO_SIZE
+/**
+ * @brief 使用intfp库的log格式实现"先慢后快"增长曲线的压力因子计算函数。
+ * @param mem_pressure 当前内存压力值（0-100）。
+ * @param zram_pressure 当前ZRAM压力值（0-100）。
+ * @return u64 最终的压力因子百分比，范围从100到200。
+ */
+u64 calculate_pressure_factor_log_slow_to_fast_kernel(u64 mem_pressure, u64 zram_pressure) {
+    s32 pressure_diff = 0;
+    s32 pressure_increase_log;
+    s32 base_factor_log;
+    s32 combined_factor_log;
+    s32 scaling_factor_log;
+    u64 combined_pressure_factor_percent;
+
+    if (mem_pressure > 60) {
+        pressure_diff += (s32)(mem_pressure - 60);
+    }
+    if (zram_pressure > 50) {
+        pressure_diff += (s32)(zram_pressure - 50);
+    }
+
+    if (pressure_diff <= 0) {
+        return 100ULL;
+    }
+
+    // 1. 将压力差转换为 log 格式
+    pressure_increase_log = u64_to_log32fpmax((u64)pressure_diff);
+
+    // 2.添加一个缩放因子来减缓增长
+    scaling_factor_log = u64_to_log32fpmax(15ULL);  // log(15)
+    pressure_increase_log = pressure_increase_log - scaling_factor_log;  // log(x) - log(15) = log(x/15)
+
+    // 3. 将基础因子（100）转换为 log 格式
+    base_factor_log = u64_to_log32fpmax(100ULL);
+
+    // 4. 在 log 空间中相加，模拟线性空间的乘法
+    combined_factor_log = base_factor_log + pressure_increase_log;
+
+    // 5. 将结果从 log 格式转换回线性整数
+    combined_pressure_factor_percent = log32fpmax_to_u64(combined_factor_log);
+
+    // 6. 限制结果的范围
+    combined_pressure_factor_percent = min(combined_pressure_factor_percent, 200ULL);
+    if (combined_pressure_factor_percent < 100ULL) {
+        combined_pressure_factor_percent = 100ULL;
+    }
+
+    return combined_pressure_factor_percent;
+}
+#endif
+
 static ssize_t disksize_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t len)
 {
@@ -2020,7 +2132,63 @@ static ssize_t disksize_store(struct device *dev,
 	int err;
 	u32 prio;
 
+#ifdef CONFIG_ZRAM_AUTO_SIZE
+	if (sysfs_streq(buf, "auto")) {
+        unsigned long total_mem = (u64)totalram_pages() << PAGE_SHIFT; // 总物理内存
+        unsigned int num_cores = num_online_cpus(); // 在线 CPU 核心数
+        u64 base_ratio;
+		u64 target_size;
+        u64 combined_pressure_factor_percent;
+
+        // 1. 优化 base_ratio 的计算：确保 8 核时达到 100%
+        // 每个核心贡献 13%，上限 100%
+        base_ratio = min(num_cores * 13ULL, 100ULL); 
+        
+        // 计算基于内存和核心数的初始目标大小
+        target_size = div64_ul(total_mem * base_ratio, 100ULL);
+
+        // 2. 引入历史内存和 Zram 压力因子
+        spin_lock(&zram->pressure_lock);
+        unsigned int mem_pressure = zram->historical_mem_pressure;
+        unsigned int zram_pressure = zram->historical_zram_pressure;
+        spin_unlock(&zram->pressure_lock);
+
+        combined_pressure_factor_percent = 100ULL; // 默认压力因子为 100% (不增加也不减少)
+
+        // 根据压力数据调整因子
+    	combined_pressure_factor_percent = calculate_pressure_factor_log_slow_to_fast_kernel(mem_pressure, zram_pressure);
+
+        // 应用压力因子
+        target_size = div64_ul(target_size * combined_pressure_factor_percent, 100ULL);
+
+        // 3. 向上取整到最近的 GB
+        target_size = _round_up(target_size, 1ULL << 30);
+
+        // 4. 调整 clamp 范围：允许 Zram 大小超过物理内存
+        // 最小 Zram 1GB，或总内存的 1/8 （取两者最大值）
+        u64 min_allowed_size = max(1ULL * 1024 * 1024 * 1024ULL, div64_ul(total_mem, 8ULL)); 
+        // 最大 Zram 可以是 64GB，或总内存的 2 倍（取两者最小值）
+        u64 max_allowed_size = min(64ULL * 1024 * 1024 * 1024ULL, total_mem * 2ULL); 
+        
+        // 确保最小不会超过最大
+        if (min_allowed_size > max_allowed_size) {
+            min_allowed_size = max_allowed_size; 
+        }
+
+        target_size = clamp(target_size, min_allowed_size, max_allowed_size);
+        
+        pr_info("zram: auto-calculated disksize: %llu (mem: %luGB, cores: %u, pressure: %u:%u, factor: %llu%%)\n",
+                target_size, total_mem >> 30, num_cores, mem_pressure, zram_pressure, combined_pressure_factor_percent);
+
+		disksize = target_size;
+    } else {
+        // 用户手动设置 Zram 大小
+        disksize  = memparse(buf, NULL);
+	}
+#else
 	disksize = memparse(buf, NULL);
+#endif
+
 	if (!disksize)
 		return -EINVAL;
 
@@ -2125,6 +2293,117 @@ static const struct block_device_operations zram_devops = {
 	.owner = THIS_MODULE
 };
 
+#ifdef CONFIG_ZRAM_AUTO_SIZE
+static ssize_t pressure_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    struct zram *zram;
+    unsigned int mem_pressure, zram_pressure;
+    
+    // 参数合法性检查
+    if (!dev || !buf) {
+        pr_err("zram: invalid parameters in pressure_show\n");
+        return -EINVAL;
+    }
+    
+    zram = dev_to_zram(dev);
+    if (!zram) {
+        pr_warn("zram: zram device data is NULL\n");
+        return scnprintf(buf, PAGE_SIZE, "NULL:NULL\n");
+    }
+    
+    // 在读取时也需要加锁，确保数据一致性
+    spin_lock(&zram->pressure_lock);
+    mem_pressure = zram->historical_mem_pressure;
+    zram_pressure = zram->historical_zram_pressure;
+    spin_unlock(&zram->pressure_lock);
+    
+    // 使用 scnprintf 而不是 sprintf，更安全
+    return scnprintf(buf, PAGE_SIZE, "%u:%u\n", mem_pressure, zram_pressure);
+}
+
+static ssize_t pressure_store(struct device *dev, struct device_attribute *attr,
+                               const char *buf, size_t len)
+{
+    struct zram *zram = dev_to_zram(dev);
+    unsigned int mem_pressure, zram_pressure;
+    char *colon_pos;
+    char *local_buf;
+    int ret = -EINVAL;
+
+    pr_debug("zram: pressure_store called with len=%zu, buf='%.*s'\n", 
+             len, (int)len, buf);
+
+    // 参数合法性检查
+    if (!buf || len == 0) {
+        pr_err("zram: invalid buffer parameters\n");
+        return -EINVAL;
+    }
+    
+    if (!zram) {
+        pr_err("zram: zram device data is NULL\n");
+        return -ENODEV;
+    }
+
+    // 分配本地缓冲区，避免修改原始buf
+    local_buf = kmalloc(len + 1, GFP_KERNEL);
+    if (!local_buf) {
+        pr_err("zram: memory allocation failed\n");
+        return -ENOMEM;
+    }
+
+    // 复制数据并确保字符串终止
+    memcpy(local_buf, buf, len);
+    local_buf[len] = '\0';
+
+    // 移除可能的换行符
+    if (len > 0 && local_buf[len - 1] == '\n') {
+        local_buf[len - 1] = '\0';
+    }
+
+    // 查找冒号分隔符
+    colon_pos = strchr(local_buf, ':');
+    if (!colon_pos) {
+        pr_err("zram: invalid pressure format, expected 'mem_pressure:zram_pressure'\n");
+        ret = -EINVAL;
+        goto out;
+    }
+
+    // 分割字符串
+    *colon_pos = '\0';
+
+    // 解析内存压力
+    ret = kstrtouint(local_buf, 10, &mem_pressure);
+    if (ret) {
+        pr_err("zram: invalid memory pressure value\n");
+        goto out;
+    }
+
+    // 解析 Zram 压力
+    ret = kstrtouint(colon_pos + 1, 10, &zram_pressure);
+    if (ret) {
+        pr_err("zram: invalid zram pressure value\n");
+        goto out;
+    }
+
+    // 限制压力值在 0-100 之间
+    mem_pressure = clamp(mem_pressure, 0U, 100U);
+    zram_pressure = clamp(zram_pressure, 0U, 100U);
+
+    spin_lock(&zram->pressure_lock);
+    zram->historical_mem_pressure = mem_pressure;
+    zram->historical_zram_pressure = zram_pressure;
+    spin_unlock(&zram->pressure_lock);
+
+    pr_debug("zram: updated historical pressure to %u:%u\n", mem_pressure, zram_pressure);
+    
+    ret = len;
+
+out:
+    kfree(local_buf);
+    return ret;
+}
+#endif
+
 static DEVICE_ATTR_WO(compact);
 static DEVICE_ATTR_RW(disksize);
 static DEVICE_ATTR_RO(initstate);
@@ -2143,6 +2422,9 @@ static DEVICE_ATTR_RW(writeback_limit_enable);
 #ifdef CONFIG_ZRAM_MULTI_COMP
 static DEVICE_ATTR_RW(recomp_algorithm);
 static DEVICE_ATTR_WO(recompress);
+#endif
+#ifdef CONFIG_ZRAM_AUTO_SIZE
+static DEVICE_ATTR_RW(pressure);
 #endif
 
 static struct attribute *zram_disk_attrs[] = {
@@ -2171,6 +2453,9 @@ static struct attribute *zram_disk_attrs[] = {
 	&dev_attr_recomp_algorithm.attr,
 	&dev_attr_recompress.attr,
 #endif
+#ifdef CONFIG_ZRAM_AUTO_SIZE
+	&dev_attr_pressure.attr,
+#endif
 	NULL,
 };
 
@@ -2184,6 +2469,8 @@ static int zram_add(void)
 {
 	struct zram *zram;
 	int ret, device_id;
+	unsigned long total_mem = (u64)totalram_pages() << PAGE_SHIFT; // 总物理内存
+	u64 default_disksize = _round_up(total_mem, 1ULL << 30);
 
 	zram = kzalloc(sizeof(struct zram), GFP_KERNEL);
 	if (!zram)
@@ -2214,10 +2501,49 @@ static int zram_add(void)
 	zram->disk->flags |= GENHD_FL_NO_PART;
 	zram->disk->fops = &zram_devops;
 	zram->disk->private_data = zram;
+
+#ifdef CONFIG_ZRAM_AUTO_SIZE
+	spin_lock_init(&zram->pressure_lock);
+	zram->historical_mem_pressure = 0; 
+	zram->historical_zram_pressure = 0;
+#endif
+
 	snprintf(zram->disk->disk_name, 16, "zram%d", device_id);
+
+	comp_algorithm_set(zram, ZRAM_PRIMARY_COMP, default_compressor);
 
 	/* Actual capacity set using sysfs (/sys/block/zram<id>/disksize */
 	set_capacity(zram->disk, 0);
+
+	down_write(&zram->init_lock);
+	if (!zram_meta_alloc(zram, default_disksize)) {
+		up_write(&zram->init_lock);
+		ret = -ENOMEM;
+		goto out_cleanup_disk;
+	}
+
+	for (u32 prio = 0; prio < ZRAM_MAX_COMPS; prio++) {
+		if (!zram->comp_algs[prio])
+			continue;
+
+		struct zcomp *comp = zcomp_create(zram->comp_algs[prio]);
+		if (IS_ERR(comp)) {
+			pr_err("Cannot initialise %s compressing backend\n",
+				zram->comp_algs[prio]);
+			zram_destroy_comps(zram); // 清理已创建的压缩器
+			zram_meta_free(zram, default_disksize); // 释放元数据
+			up_write(&zram->init_lock);
+			ret = PTR_ERR(comp);
+			goto out_cleanup_disk;
+		}
+		zram->comps[prio] = comp;
+		zram->num_active_comps++;
+	}
+
+	zram->disksize = default_disksize;
+	set_capacity_and_notify(zram->disk, zram->disksize >> SECTOR_SHIFT);
+	up_write(&zram->init_lock);
+
 	/* zram devices sort of resembles non-rotational disks */
 	blk_queue_flag_set(QUEUE_FLAG_NONROT, zram->disk->queue);
 	blk_queue_flag_set(QUEUE_FLAG_SYNCHRONOUS, zram->disk->queue);
@@ -2239,7 +2565,7 @@ static int zram_add(void)
 	 * size is identical with physical block size(PAGE_SIZE). But if it is
 	 * different, we will skip discarding some parts of logical blocks in
 	 * the part of the request range which isn't aligned to physical block
-	 * size.  So we can't ensure that all discarded logical blocks are
+	 * size.  So we can't ensure that all discarded logical blocks are
 	 * zeroed.
 	 */
 	if (ZRAM_LOGICAL_BLOCK_SIZE == PAGE_SIZE)
@@ -2250,10 +2576,8 @@ static int zram_add(void)
 	if (ret)
 		goto out_cleanup_disk;
 
-	comp_algorithm_set(zram, ZRAM_PRIMARY_COMP, default_compressor);
-
 	zram_debugfs_register(zram);
-	pr_info("Added device: %s\n", zram->disk->disk_name);
+	pr_info("Added device: %s with default size %llu bytes\n", zram->disk->disk_name, default_disksize);
 	return device_id;
 
 out_cleanup_disk:
@@ -2398,6 +2722,90 @@ static void destroy_devices(void)
 	cpuhp_remove_multi_state(CPUHP_ZCOMP_PREPARE);
 }
 
+// 触发zram_writeback
+static void zram_writeback(struct zram *zram)
+{
+	struct device_attribute attr = {};
+	// char *buf_idle = "all";
+	char *buf_write_back = "idle";
+	// size_t len_idle = strlen(buf_idle) + 1;
+	size_t len_write_back = strlen(buf_write_back) + 1;
+
+	/* Simulate sysfs write to trigger writeback */
+	down_read(&zram->init_lock);
+	if (!init_done(zram) || !zram->backing_dev) {
+		up_read(&zram->init_lock);
+		pr_debug("Writeback skipped: device not initialized or no backing device\n");
+		return;
+	}
+#ifdef CONFIG_ZRAM_WRITEBACK
+	// idle_store(disk_to_dev(zram->disk), &attr, buf_idle, len_idle);
+	writeback_store(disk_to_dev(zram->disk), &attr, buf_write_back, len_write_back);
+#endif
+	up_read(&zram->init_lock);
+}
+
+// 计算zram使用率
+static unsigned long get_zram_usage(struct zram *zram)
+{
+	u64 pages_stored, total_pages, bd_writes;
+
+	down_read(&zram->init_lock);
+	if (!init_done(zram)) {
+		up_read(&zram->init_lock);
+		return 0;
+	}
+	pages_stored = atomic64_read(&zram->stats.pages_stored);
+	bd_writes = atomic64_read(&zram->stats.bd_writes);
+	total_pages = zram->disksize >> PAGE_SHIFT;
+	up_read(&zram->init_lock);
+
+	if (total_pages == 0)
+		return 0;
+
+	return ((pages_stored - bd_writes) * 100) / total_pages;
+}
+
+// 计算内存占用率
+static int get_memory_usage(void)
+{
+    struct sysinfo si;
+    si_meminfo(&si);
+
+    unsigned long total = si.totalram;
+    unsigned long free = si_mem_available();
+
+    if (total == 0)
+        return 0;
+
+    return ((total - free) * 100) / total;
+}
+
+// 监控线程函数
+static int monitor_func(void *data)
+{
+	struct zram *zram;
+	int id;
+    while (!kthread_should_stop()) {
+		mutex_lock(&zram_index_mutex);
+		idr_for_each_entry(&zram_index_idr, zram, id) {
+			unsigned long zram_usage = get_zram_usage(zram);
+			int mem_usage = get_memory_usage();
+			pr_info("zram_usage=%lu%%, mem_usage=%d%%\n",
+               zram_usage, mem_usage);
+        	if (zram_usage > ZRAM_THRESHOLD && mem_usage > MEM_THRESHOLD) {
+            	pr_info("Thresholds exceeded, triggering writeback\n");
+            	zram_writeback(zram);
+        		}
+			}
+		mutex_unlock(&zram_index_mutex);
+
+        schedule_timeout_interruptible(CHECK_INTERVAL);
+    }
+    return 0;
+}
+
+
 static int __init zram_init(void)
 {
 	int ret;
@@ -2434,6 +2842,8 @@ static int __init zram_init(void)
 		num_devices--;
 	}
 
+	monitor_thread = kthread_run(monitor_func, NULL, "zram_monitor");
+
 	return 0;
 
 out_error:
@@ -2443,6 +2853,10 @@ out_error:
 
 static void __exit zram_exit(void)
 {
+	if (monitor_thread) {
+        kthread_stop(monitor_thread);
+        monitor_thread = NULL;
+    }
 	destroy_devices();
 }
 
@@ -2454,4 +2868,5 @@ MODULE_PARM_DESC(num_devices, "Number of pre-created zram devices");
 
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("Nitin Gupta <ngupta@vflare.org>");
+MODULE_AUTHOR("Coolapk@BrokeStar");
 MODULE_DESCRIPTION("Compressed RAM Block Device");

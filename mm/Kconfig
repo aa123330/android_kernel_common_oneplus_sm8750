@@ -147,11 +147,14 @@ config ZSWAP_ZPOOL_DEFAULT_ZBUD
 	help
 	  Use the zbud allocator as the default allocator.
 
-config ZSWAP_ZPOOL_DEFAULT_Z3FOLD
-	bool "z3fold"
-	select Z3FOLD
+config ZSWAP_ZPOOL_DEFAULT_Z3FOLD_DEPRECATED
+	bool "z3foldi (DEPRECATED)"
+	select Z3FOLD_DEPRECATED
 	help
 	  Use the z3fold allocator as the default allocator.
+
+	  Deprecated and scheduled for removal in a few cycles,
+	  see CONFIG_Z3FOLD_DEPRECATED.
 
 config ZSWAP_ZPOOL_DEFAULT_ZSMALLOC
 	bool "zsmalloc"
@@ -164,7 +167,7 @@ config ZSWAP_ZPOOL_DEFAULT
        string
        depends on ZSWAP
        default "zbud" if ZSWAP_ZPOOL_DEFAULT_ZBUD
-       default "z3fold" if ZSWAP_ZPOOL_DEFAULT_Z3FOLD
+       default "z3fold" if ZSWAP_ZPOOL_DEFAULT_Z3FOLD_DEPRECATED
        default "zsmalloc" if ZSWAP_ZPOOL_DEFAULT_ZSMALLOC
        default ""
 
@@ -178,14 +181,24 @@ config ZBUD
 	  deterministic reclaim properties that make it preferable to a higher
 	  density approach when reclaim will be used.
 
-config Z3FOLD
-	tristate "3:1 compression allocator (z3fold)"
+config Z3FOLD_DEPRECATED
+	tristate "3:1 compression allocator (z3fold) (DEPRECATED)"
 	depends on ZSWAP
 	help
+	  Deprecated and scheduled for removal in a few cycles. If you have
+	  a good reason for using Z3FOLD over ZSMALLOC, please contact
+	  linux-mm@kvack.org and the zswap maintainers.
+
 	  A special purpose allocator for storing compressed pages.
 	  It is designed to store up to three compressed pages per physical
 	  page. It is a ZBUD derivative so the simplicity and determinism are
 	  still there.
+
+config Z3FOLD
+	tristate
+	default y if Z3FOLD_DEPRECATED=y
+	default m if Z3FOLD_DEPRECATED=m
+	depends on Z3FOLD_DEPRECATED
 
 config ZSMALLOC
 	tristate
@@ -509,6 +522,69 @@ config ARCH_WANT_OPTIMIZE_DAX_VMEMMAP
 config ARCH_WANT_OPTIMIZE_HUGETLB_VMEMMAP
 	bool
 
+config ANON_MIN_RATIO
+	int "Default value for vm.anon_min_ratio"
+	depends on SYSCTL
+	range 0 100
+	default 1
+	help
+	  This option sets the default value for vm.anon_min_ratio sysctl knob.
+
+	  The vm.anon_min_ratio sysctl knob provides *hard* protection of
+	  anonymous pages. The anonymous pages on the current node won't be
+	  reclaimed under any conditions when their amount is below
+	  vm.anon_min_ratio. This knob may be used to prevent excessive swap
+	  thrashing when anonymous memory is low (for example, when memory is
+	  going to be overfilled by compressed data of zram module).
+
+	  Setting this value too high (close to MemTotal) can result in
+	  inability to swap and can lead to early OOM under memory pressure.
+
+config CLEAN_LOW_RATIO
+	int "Default value for vm.clean_low_ratio"
+	depends on SYSCTL
+	range 0 100
+	default 15
+	help
+	  This option sets the default value for vm.clean_low_ratio sysctl knob.
+
+	  The vm.clean_low_ratio sysctl knob provides *best-effort*
+	  protection of clean file pages. The file pages on the current node
+	  won't be reclaimed under memory pressure when the amount of clean file
+	  pages is below vm.clean_low_ratio *unless* we threaten to OOM.
+	  Protection of clean file pages using this knob may be used when
+	  swapping is still possible to
+	    - prevent disk I/O thrashing under memory pressure;
+	    - improve performance in disk cache-bound tasks under memory
+	      pressure.
+
+	  Setting it to a high value may result in a early eviction of anonymous
+	  pages into the swap space by attempting to hold the protected amount
+	  of clean file pages in memory.
+
+config CLEAN_MIN_RATIO
+	int "Default value for vm.clean_min_ratio"
+	depends on SYSCTL
+	range 0 100
+	default 4
+	help
+	  This option sets the default value for vm.clean_min_ratio sysctl knob.
+
+	  The vm.clean_min_ratio sysctl knob provides *hard* protection of
+	  clean file pages. The file pages on the current node won't be
+	  reclaimed under memory pressure when the amount of clean file pages is
+	  below vm.clean_min_ratio. Hard protection of clean file pages using
+	  this knob may be used to
+	    - prevent disk I/O thrashing under memory pressure even with no free
+	      swap space;
+	    - improve performance in disk cache-bound tasks under memory
+	      pressure;
+	    - avoid high latency and prevent livelock in near-OOM conditions.
+
+	  Setting it to a high value may result in a early out-of-memory condition
+	  due to the inability to reclaim the protected amount of clean file pages
+	  when other types of pages cannot be reclaimed.
+
 config HAVE_MEMBLOCK_PHYS_MAP
 	bool
 
@@ -711,6 +787,17 @@ config HUGETLB_PAGE_SIZE_VARIABLE
 config CONTIG_ALLOC
 	def_bool (MEMORY_ISOLATION && COMPACTION) || CMA
 
+config PCP_BATCH_SCALE_MAX
+	int "Maximum scale factor of PCP (Per-CPU pageset) batch allocate/free"
+	default 5
+	range 0 6
+	help
+	  In page allocator, PCP (Per-CPU pageset) is refilled and drained in
+	  batches.  The batch number is scaled automatically to improve page
+	  allocation/free throughput.  But too large scale factor may hurt
+	  latency.  This option sets the upper limit of scale factor to limit
+	  the maximum latency.
+
 config PHYS_ADDR_T_64BIT
 	def_bool 64BIT
 
@@ -729,6 +816,7 @@ config MMU_NOTIFIER
 
 config KSM
 	bool "Enable KSM for page merging"
+	default y
 	depends on MMU
 	select XXHASH
 	help
@@ -741,6 +829,53 @@ config KSM
 	  See Documentation/mm/ksm.rst for more information: KSM is inactive
 	  until a program has madvised that an area is MADV_MERGEABLE, and
 	  root has set /sys/kernel/mm/ksm/run to 1 (if CONFIG_SYSFS is set).
+choice
+	prompt "Choose UKSM/KSM strategy"
+	default UKSM
+	depends on KSM
+	help
+	  This option allows to select a UKSM/KSM stragety.
+
+config UKSM
+	bool "Ultra-KSM for page merging"
+	default y
+	depends on KSM
+	help
+	UKSM is inspired by the Linux kernel project \u2014 KSM(Kernel Same
+	page Merging), but with a fundamentally rewritten core algorithm. With
+	an advanced algorithm, UKSM now can transparently scans all anonymously
+	mapped user space applications with an significantly improved scan speed
+	and CPU efficiency. Since KVM is friendly to KSM, KVM can also benefit from
+	UKSM. Now UKSM has its first stable release and first real world enterprise user.
+	For more information, please goto its project page.
+	(github.com/dolohow/uksm)
+
+config KSM_LEGACY
+	bool "Legacy KSM implementation"
+	default n
+	depends on KSM
+	help
+	The legacy KSM implementation from Red Hat.
+endchoice
+
+if UKSM
+
+config UKSM_CPU_GOVERNOR
+	int "Ultra-KSM default CPU governor"
+	range 0 4
+	help
+	The UKSM default CPU governor.
+	0: full
+	1: medium
+	2: low
+	3: quiet
+	4: android
+
+config UKSM_SLEEP_MS
+	int "Ultra-KSM default sleep millisecs"
+	range 8 60000
+
+endif
 
 config DEFAULT_MMAP_MIN_ADDR
 	int "Low address space to protect from user allocation"
@@ -969,6 +1104,40 @@ config CMA_AREAS
 	  number of CMA area in the system.
 
 	  If unsure, leave the default value "7" in UMA and "19" in NUMA.
+
+#
+# Select this config option from the architecture Kconfig, if available, to set
+# the max page order for physically contiguous allocations.
+#
+config ARCH_FORCE_MAX_ORDER
+	int
+
+#
+# When ARCH_FORCE_MAX_ORDER is not defined,
+# the default page block order is MAX_PAGE_ORDER (10) as per
+# include/linux/mmzone.h.
+#
+config PAGE_BLOCK_ORDER
+	int "Page Block Order"
+	range 1 10 if ARCH_FORCE_MAX_ORDER = 0 || ARCH_FORCE_MAX_ORDER = ""
+	default 10 if ARCH_FORCE_MAX_ORDER = 0 || ARCH_FORCE_MAX_ORDER = ""
+	range 1 ARCH_FORCE_MAX_ORDER if ARCH_FORCE_MAX_ORDER != 0
+	default ARCH_FORCE_MAX_ORDER if ARCH_FORCE_MAX_ORDER != 0
+	help
+	  The page block order refers to the power of two number of pages that
+	  are physically contiguous and can have a migrate type associated to
+	  them. The maximum size of the page block order is limited by
+	  ARCH_FORCE_MAX_ORDER.
+
+	  This config allows overriding the default page block order when the
+	  page block order is required to be smaller than ARCH_FORCE_MAX_ORDER
+	  or MAX_ORDER.
+
+	  Reducing pageblock order can negatively impact THP generation
+	  success rate. If your workloads uses THP heavily, please use this
+	  option with caution.
+
+	  Don't change if unsure.
 
 config MEM_SOFT_DIRTY
 	bool "Track memory changes"
@@ -1291,6 +1460,17 @@ config PER_VMA_LOCK
 config LOCK_MM_AND_FIND_VMA
 	bool
 	depends on !STACK_GROWSUP
+
+config MEMFD_ASHMEM_SHIM
+	bool "Memfd ashmem ioctl compatibility support"
+	depends on MEMFD_CREATE
+	help
+	  This provides compatibility support for ashmem ioctl commands against
+	  memfd file descriptors. This is useful for compatibility on Android
+	  for older applications that may use ashmem's ioctl commands on the
+	  now memfds passed to them.
+
+	  Unless you are running Android, say N.
 
 source "mm/damon/Kconfig"
 

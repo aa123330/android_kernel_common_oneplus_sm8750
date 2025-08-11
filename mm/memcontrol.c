@@ -33,6 +33,7 @@
 #include <linux/shmem_fs.h>
 #include <linux/hugetlb.h>
 #include <linux/pagemap.h>
+#include <linux/pagevec.h>
 #include <linux/vm_event_item.h>
 #include <linux/smp.h>
 #include <linux/page-flags.h>
@@ -74,6 +75,7 @@
 
 #include <trace/events/vmscan.h>
 #include <trace/hooks/mm.h>
+#include <trace/hooks/vmscan.h>
 
 struct cgroup_subsys memory_cgrp_subsys __read_mostly;
 EXPORT_SYMBOL(memory_cgrp_subsys);
@@ -93,6 +95,9 @@ static bool cgroup_memory_nokmem __ro_after_init;
 
 /* BPF memory accounting disabled? */
 static bool cgroup_memory_nobpf __ro_after_init;
+
+static struct kmem_cache *memcg_cachep;
+static struct kmem_cache *memcg_pn_cachep;
 
 #ifdef CONFIG_CGROUP_WRITEBACK
 static DECLARE_WAIT_QUEUE_HEAD(memcg_cgwb_frn_waitq);
@@ -249,6 +254,16 @@ struct vmpressure *memcg_to_vmpressure(struct mem_cgroup *memcg)
 struct mem_cgroup *vmpressure_to_memcg(struct vmpressure *vmpr)
 {
 	return container_of(vmpr, struct mem_cgroup, vmpressure);
+}
+
+/*
+ * trace_android_vh_use_vm_swappiness is called in include/linux/swap.h by
+ * including include/trace/hooks/vmscan.h, which will result to build-err.
+ * So we create func: _trace_android_vh_use_vm_swappiness.
+ */
+void _trace_android_vh_use_vm_swappiness(bool *use_vm_swappiness)
+{
+	trace_android_vh_use_vm_swappiness(use_vm_swappiness);
 }
 
 #ifdef CONFIG_MEMCG_KMEM
@@ -709,6 +724,7 @@ static inline void memcg_rstat_updated(struct mem_cgroup *memcg, int val)
 {
 	struct memcg_vmstats_percpu *statc;
 	int cpu = smp_processor_id();
+	unsigned int stats_updates;
 
 	if (!val)
 		return;
@@ -716,8 +732,9 @@ static inline void memcg_rstat_updated(struct mem_cgroup *memcg, int val)
 	cgroup_rstat_updated(memcg->css.cgroup, cpu);
 	statc = this_cpu_ptr(memcg->vmstats_percpu);
 	for (; statc; statc = statc->parent) {
-		statc->stats_updates += abs(val);
-		if (statc->stats_updates < MEMCG_CHARGE_BATCH)
+		stats_updates = READ_ONCE(statc->stats_updates) + abs(val);
+		WRITE_ONCE(statc->stats_updates, stats_updates);
+		if (stats_updates < MEMCG_CHARGE_BATCH)
 			continue;
 
 		/*
@@ -725,9 +742,9 @@ static inline void memcg_rstat_updated(struct mem_cgroup *memcg, int val)
 		 * redundant. Avoid the overhead of the atomic update.
 		 */
 		if (!memcg_vmstats_needs_flush(statc->vmstats))
-			atomic64_add(statc->stats_updates,
+			atomic64_add(stats_updates,
 				     &statc->vmstats->stats_updates);
-		statc->stats_updates = 0;
+		WRITE_ONCE(statc->stats_updates, 0);
 	}
 }
 
@@ -786,6 +803,13 @@ unsigned long memcg_page_state(struct mem_cgroup *memcg, int idx)
 #endif
 	return x;
 }
+EXPORT_SYMBOL_GPL(memcg_page_state);
+
+/* For type visibility of memcg_page_state indices */
+const enum node_stat_item ANDROID_GKI_node_stat_item;
+EXPORT_SYMBOL_GPL(ANDROID_GKI_node_stat_item);
+const enum memcg_stat_item ANDROID_GKI_memcg_stat_item;
+EXPORT_SYMBOL_GPL(ANDROID_GKI_memcg_stat_item);
 
 /**
  * __mod_memcg_state - update cgroup memory statistics
@@ -853,6 +877,7 @@ void __mod_memcg_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
 	memcg_rstat_updated(memcg, val);
 	memcg_stats_unlock();
 }
+EXPORT_SYMBOL_GPL(__mod_memcg_lruvec_state);
 
 /**
  * __mod_lruvec_state - update lruvec memory statistics
@@ -1301,8 +1326,11 @@ void mem_cgroup_scan_tasks(struct mem_cgroup *memcg,
 		struct task_struct *task;
 
 		css_task_iter_start(&iter->css, CSS_TASK_ITER_PROCS, &it);
-		while (!ret && (task = css_task_iter_next(&it)))
+		while (!ret && (task = css_task_iter_next(&it))) {
 			ret = fn(task, arg);
+			/* Avoid potential softlockup warning */
+			cond_resched();
+		}
 		css_task_iter_end(&it);
 		if (ret) {
 			mem_cgroup_iter_break(memcg, iter);
@@ -1408,8 +1436,16 @@ void do_traversal_all_lruvec(void)
 		memcg = mem_cgroup_iter(NULL, NULL, NULL);
 		do {
 			struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
+			bool stop = false;
 
 			trace_android_vh_do_traversal_lruvec(lruvec);
+
+			trace_android_rvh_do_traversal_lruvec_ex(memcg, lruvec,
+								 &stop);
+			if (stop) {
+				mem_cgroup_iter_break(NULL, memcg);
+				break;
+			}
 
 			memcg = mem_cgroup_iter(NULL, memcg, NULL);
 		} while (memcg);
@@ -4974,9 +5010,12 @@ static ssize_t memcg_write_event_control(struct kernfs_open_file *of,
 	buf = endp + 1;
 
 	cfd = simple_strtoul(buf, &endp, 10);
-	if ((*endp != ' ') && (*endp != '\0'))
+	if (*endp == '\0')
+		buf = endp;
+	else if (*endp == ' ')
+		buf = endp + 1;
+	else
 		return -EINVAL;
-	buf = endp + 1;
 
 	event = kzalloc(sizeof(*event), GFP_KERNEL);
 	if (!event)
@@ -5261,12 +5300,29 @@ static struct cftype mem_cgroup_legacy_files[] = {
 
 #define MEM_CGROUP_ID_MAX	((1UL << MEM_CGROUP_ID_SHIFT) - 1)
 static DEFINE_IDR(mem_cgroup_idr);
+static DEFINE_SPINLOCK(memcg_idr_lock);
+
+static int mem_cgroup_alloc_id(void)
+{
+	int ret;
+
+	idr_preload(GFP_KERNEL);
+	spin_lock(&memcg_idr_lock);
+	ret = idr_alloc(&mem_cgroup_idr, NULL, 1, MEM_CGROUP_ID_MAX + 1,
+			GFP_NOWAIT);
+	spin_unlock(&memcg_idr_lock);
+	idr_preload_end();
+	return ret;
+}
 
 static void mem_cgroup_id_remove(struct mem_cgroup *memcg)
 {
 	if (memcg->id.id > 0) {
 		trace_android_vh_mem_cgroup_id_remove(memcg);
+		spin_lock(&memcg_idr_lock);
 		idr_remove(&mem_cgroup_idr, memcg->id.id);
+		spin_unlock(&memcg_idr_lock);
+
 		memcg->id.id = 0;
 	}
 }
@@ -5332,7 +5388,8 @@ static int alloc_mem_cgroup_per_node_info(struct mem_cgroup *memcg, int node)
 {
 	struct mem_cgroup_per_node *pn;
 
-	pn = kzalloc_node(sizeof(*pn), GFP_KERNEL, node);
+	pn = kmem_cache_alloc_node(memcg_pn_cachep, GFP_KERNEL | __GFP_ZERO,
+				   node);
 	if (!pn)
 		return 1;
 
@@ -5388,12 +5445,11 @@ static struct mem_cgroup *mem_cgroup_alloc(struct mem_cgroup *parent)
 	int __maybe_unused i;
 	long error = -ENOMEM;
 
-	memcg = kzalloc(struct_size(memcg, nodeinfo, nr_node_ids), GFP_KERNEL);
+	memcg = kmem_cache_zalloc(memcg_cachep, GFP_KERNEL);
 	if (!memcg)
 		return ERR_PTR(error);
 
-	memcg->id.id = idr_alloc(&mem_cgroup_idr, NULL,
-				 1, MEM_CGROUP_ID_MAX + 1, GFP_KERNEL);
+	memcg->id.id = mem_cgroup_alloc_id();
 	if (memcg->id.id < 0) {
 		error = memcg->id.id;
 		goto fail;
@@ -5537,7 +5593,9 @@ static int mem_cgroup_css_online(struct cgroup_subsys_state *css)
 	 * publish it here at the end of onlining. This matches the
 	 * regular ID destruction during offlining.
 	 */
+	spin_lock(&memcg_idr_lock);
 	idr_replace(&mem_cgroup_idr, memcg, memcg->id.id);
+	spin_unlock(&memcg_idr_lock);
 
 	trace_android_vh_mem_cgroup_css_online(css, memcg);
 	return 0;
@@ -5739,7 +5797,7 @@ static void mem_cgroup_css_rstat_flush(struct cgroup_subsys_state *css, int cpu)
 			}
 		}
 	}
-	statc->stats_updates = 0;
+	WRITE_ONCE(statc->stats_updates, 0);
 	/* We are in a per-cpu loop here, only do the atomic write once */
 	if (atomic64_read(&memcg->vmstats->stats_updates))
 		atomic64_set(&memcg->vmstats->stats_updates, 0);
@@ -5873,7 +5931,7 @@ static struct page *mc_handle_file_pte(struct vm_area_struct *vma,
  * This function doesn't do "charge" to new cgroup and doesn't do "uncharge"
  * from old cgroup.
  */
-static int mem_cgroup_move_account(struct folio *folio,
+int mem_cgroup_move_account(struct folio *folio,
 				   bool compound,
 				   struct mem_cgroup *from,
 				   struct mem_cgroup *to)
@@ -5980,6 +6038,7 @@ static int mem_cgroup_move_account(struct folio *folio,
 out:
 	return ret;
 }
+EXPORT_SYMBOL_GPL(mem_cgroup_move_account);
 
 /**
  * get_mctgt_type - get target type of moving charge
@@ -7133,11 +7192,13 @@ int __mem_cgroup_charge(struct folio *folio, struct mm_struct *mm, gfp_t gfp)
 	int ret;
 
 	memcg = get_mem_cgroup_from_mm(mm);
+	trace_android_vh_mem_cgroup_charge(folio, &memcg);
 	ret = charge_memcg(folio, memcg, gfp);
 	css_put(&memcg->css);
 
 	return ret;
 }
+EXPORT_SYMBOL_GPL(__mem_cgroup_charge);
 
 /**
  * mem_cgroup_swapin_charge_folio - Charge a newly allocated folio for swapin.
@@ -7176,14 +7237,15 @@ int mem_cgroup_swapin_charge_folio(struct folio *folio, struct mm_struct *mm,
 
 /*
  * mem_cgroup_swapin_uncharge_swap - uncharge swap slot
- * @entry: swap entry for which the page is charged
+ * @entry: the first swap entry for which the pages are charged
+ * @nr_pages: number of pages which will be uncharged
  *
  * Call this function after successfully adding the charged page to swapcache.
  *
  * Note: This function assumes the page for which swap slot is being uncharged
  * is order 0 page.
  */
-void mem_cgroup_swapin_uncharge_swap(swp_entry_t entry)
+void mem_cgroup_swapin_uncharge_swap(swp_entry_t entry, unsigned int nr_pages)
 {
 	/*
 	 * Cgroup1's unified memory+swap counter has been charged with the
@@ -7203,7 +7265,7 @@ void mem_cgroup_swapin_uncharge_swap(swp_entry_t entry)
 		 * let's not wait for it.  The page already received a
 		 * memory+swap charge, drop the swap entry duplicate.
 		 */
-		mem_cgroup_uncharge_swap(entry, 1);
+		mem_cgroup_uncharge_swap(entry, nr_pages);
 	}
 }
 
@@ -7296,6 +7358,7 @@ static void uncharge_folio(struct folio *folio, struct uncharge_gather *ug)
 			ug->nr_memory += nr_pages;
 		ug->pgpgout++;
 
+		WARN_ON_ONCE(folio_unqueue_deferred_split(folio));
 		folio->memcg_data = 0;
 	}
 
@@ -7314,6 +7377,7 @@ void __mem_cgroup_uncharge(struct folio *folio)
 	uncharge_folio(folio, &ug);
 	uncharge_batch(&ug);
 }
+EXPORT_SYMBOL_GPL(__mem_cgroup_uncharge);
 
 /**
  * __mem_cgroup_uncharge_list - uncharge a list of page
@@ -7334,8 +7398,20 @@ void __mem_cgroup_uncharge_list(struct list_head *page_list)
 		uncharge_batch(&ug);
 }
 
+void __mem_cgroup_uncharge_folios(struct folio_batch *folios)
+{
+	struct uncharge_gather ug;
+	unsigned int i;
+
+	uncharge_gather_clear(&ug);
+	for (i = 0; i < folios->nr; i++)
+		uncharge_folio(folios->folios[i], &ug);
+	if (ug.memcg)
+		uncharge_batch(&ug);
+}
+
 /**
- * mem_cgroup_migrate - Charge a folio's replacement.
+ * mem_cgroup_replace_folio - Charge a folio's replacement.
  * @old: Currently circulating folio.
  * @new: Replacement folio.
  *
@@ -7344,7 +7420,7 @@ void __mem_cgroup_uncharge_list(struct list_head *page_list)
  *
  * Both folios must be locked, @new->mapping must be set up.
  */
-void mem_cgroup_migrate(struct folio *old, struct folio *new)
+void mem_cgroup_replace_folio(struct folio *old, struct folio *new)
 {
 	struct mem_cgroup *memcg;
 	long nr_pages = folio_nr_pages(new);
@@ -7381,6 +7457,42 @@ void mem_cgroup_migrate(struct folio *old, struct folio *new)
 	mem_cgroup_charge_statistics(memcg, nr_pages);
 	memcg_check_events(memcg, folio_nid(new));
 	local_irq_restore(flags);
+}
+
+/**
+ * mem_cgroup_migrate - Transfer the memcg data from the old to the new folio.
+ * @old: Currently circulating folio.
+ * @new: Replacement folio.
+ *
+ * Transfer the memcg data from the old folio to the new folio for migration.
+ * The old folio's data info will be cleared. Note that the memory counters
+ * will remain unchanged throughout the process.
+ *
+ * Both folios must be locked, @new->mapping must be set up.
+ */
+void mem_cgroup_migrate(struct folio *old, struct folio *new)
+{
+	struct mem_cgroup *memcg;
+
+	VM_BUG_ON_FOLIO(!folio_test_locked(old), old);
+	VM_BUG_ON_FOLIO(!folio_test_locked(new), new);
+	VM_BUG_ON_FOLIO(folio_test_anon(old) != folio_test_anon(new), new);
+	VM_BUG_ON_FOLIO(folio_nr_pages(old) != folio_nr_pages(new), new);
+
+	if (mem_cgroup_disabled())
+		return;
+
+	memcg = folio_memcg(old);
+	VM_WARN_ON_ONCE_FOLIO(!memcg, old);
+	if (!memcg)
+		return;
+
+	/* Transfer the charge and the css ref */
+	commit_charge(new, memcg);
+
+	/* Warning should never happen, so don't worry about refcount non-0 */
+	WARN_ON_ONCE(folio_unqueue_deferred_split(old));
+	old->memcg_data = 0;
 }
 
 DEFINE_STATIC_KEY_FALSE(memcg_sockets_enabled_key);
@@ -7486,15 +7598,16 @@ static int __init cgroup_memory(char *s)
 __setup("cgroup.memory=", cgroup_memory);
 
 /*
- * subsys_initcall() for memory controller.
+ * Memory controller init before cgroup_init() initialize root_mem_cgroup.
  *
  * Some parts like memcg_hotplug_cpu_dead() have to be initialized from this
  * context because of lock dependencies (cgroup_lock -> cpu hotplug) but
  * basically everything that doesn't depend on a specific mem_cgroup structure
  * should be initialized from here.
  */
-static int __init mem_cgroup_init(void)
+int __init mem_cgroup_init(void)
 {
+	unsigned int memcg_size;
 	int cpu, node;
 
 	/*
@@ -7512,6 +7625,13 @@ static int __init mem_cgroup_init(void)
 		INIT_WORK(&per_cpu_ptr(&memcg_stock, cpu)->work,
 			  drain_local_stock);
 
+	memcg_size = struct_size_t(struct mem_cgroup, nodeinfo, nr_node_ids);
+	memcg_cachep = kmem_cache_create("mem_cgroup", memcg_size, 0,
+					 SLAB_PANIC | SLAB_HWCACHE_ALIGN, NULL);
+
+	memcg_pn_cachep = KMEM_CACHE(mem_cgroup_per_node,
+				     SLAB_PANIC | SLAB_HWCACHE_ALIGN);
+
 	for_each_node(node) {
 		struct mem_cgroup_tree_per_node *rtpn;
 
@@ -7525,7 +7645,6 @@ static int __init mem_cgroup_init(void)
 
 	return 0;
 }
-subsys_initcall(mem_cgroup_init);
 
 #ifdef CONFIG_SWAP
 static struct mem_cgroup *mem_cgroup_id_get_online(struct mem_cgroup *memcg)
@@ -7589,6 +7708,7 @@ void mem_cgroup_swapout(struct folio *folio, swp_entry_t entry)
 	VM_BUG_ON_FOLIO(oldid, folio);
 	mod_memcg_state(swap_memcg, MEMCG_SWAP, nr_entries);
 
+	folio_unqueue_deferred_split(folio);
 	folio->memcg_data = 0;
 
 	if (!mem_cgroup_is_root(memcg))
@@ -7975,6 +8095,17 @@ void obj_cgroup_uncharge_zswap(struct obj_cgroup *objcg, size_t size)
 	mod_memcg_state(memcg, MEMCG_ZSWAP_B, -size);
 	mod_memcg_state(memcg, MEMCG_ZSWAPPED, -1);
 	rcu_read_unlock();
+}
+
+bool mem_cgroup_zswap_writeback_enabled(struct mem_cgroup *memcg)
+{
+	/* if zswap is disabled, do not block pages going to the swapping device */
+	if (!zswap_is_enabled())
+		return true;
+	for (; memcg; memcg = parent_mem_cgroup(memcg))
+		if (!READ_ONCE(memcg->zswap_writeback))
+			return false;
+	return true;
 }
 
 static u64 zswap_current_read(struct cgroup_subsys_state *css,

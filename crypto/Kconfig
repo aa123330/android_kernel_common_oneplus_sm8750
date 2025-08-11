@@ -57,6 +57,7 @@ config CRYPTO_FIPS_VERSION
 config CRYPTO_FIPS140_MOD
 	tristate "Enable FIPS 140 cryptographic module"
 	depends on ARM64
+	depends on CC_IS_CLANG
 	depends on m
 	select CRYPTO_FIPS140_MERGE_MOD_SECTIONS
 	help
@@ -1266,6 +1267,22 @@ config CRYPTO_LZ4
 	  LZ4 compression algorithm
 
 	  See https://github.com/lz4/lz4 for further information.
+
+config CRYPTO_LZ4K
+	tristate "LZ4K compression algorithm"
+	select CRYPTO_ALGAPI
+	select LZ4K_COMPRESS
+	select LZ4K_DECOMPRESS
+	help
+	  This is the LZ4K algorithm.
+
+config CRYPTO_LZ4KD
+	tristate "LZ4KD compression algorithm"
+	select CRYPTO_ALGAPI
+	select LZ4KD_COMPRESS
+	select LZ4KD_DECOMPRESS
+	help
+	  This is the LZ4KD algorithm.
 
 config CRYPTO_LZ4HC
 	tristate "LZ4HC"

@@ -50,6 +50,7 @@
 #include <linux/writeback.h>
 #include <linux/cpu.h>
 #include <linux/cpuset.h>
+#include <linux/memcontrol.h>
 #include <linux/cgroup.h>
 #include <linux/efi.h>
 #include <linux/tick.h>
@@ -604,7 +605,6 @@ static int __init rdinit_setup(char *str)
 __setup("rdinit=", rdinit_setup);
 
 #ifndef CONFIG_SMP
-static const unsigned int setup_max_cpus = NR_CPUS;
 static inline void setup_nr_cpu_ids(void) { }
 static inline void smp_prepare_cpus(unsigned int maxcpus) { }
 #endif
@@ -1063,6 +1063,7 @@ void start_kernel(void)
 	proc_root_init();
 	nsfs_init();
 	cpuset_init();
+	mem_cgroup_init();
 	cgroup_init();
 	taskstats_init_early();
 	delayacct_init();

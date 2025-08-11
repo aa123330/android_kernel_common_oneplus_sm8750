@@ -85,7 +85,7 @@ enum {
 	WORK_BUSY_RUNNING	= 1 << 1,
 
 	/* maximum string length for set_worker_desc() */
-	WORKER_DESC_LEN		= 24,
+	WORKER_DESC_LEN		= 32,
 };
 
 /* Convenience constants - of type 'unsigned long', not 'enum'! */
@@ -680,7 +680,7 @@ extern void __warn_flushing_systemwide_wq(void)
 static inline bool schedule_delayed_work_on(int cpu, struct delayed_work *dwork,
 					    unsigned long delay)
 {
-	return queue_delayed_work_on(cpu, system_wq, dwork, delay);
+	return queue_delayed_work_on(cpu, system_power_efficient_wq, dwork, delay);
 }
 
 /**
@@ -694,7 +694,7 @@ static inline bool schedule_delayed_work_on(int cpu, struct delayed_work *dwork,
 static inline bool schedule_delayed_work(struct delayed_work *dwork,
 					 unsigned long delay)
 {
-	return queue_delayed_work(system_wq, dwork, delay);
+	return queue_delayed_work(system_power_efficient_wq, dwork, delay);
 }
 
 #ifndef CONFIG_SMP

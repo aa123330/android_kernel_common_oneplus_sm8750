@@ -122,6 +122,10 @@ static int meminfo_proc_show(struct seq_file *m, void *v)
 		    global_node_page_state(NR_PAGETABLE));
 	show_val_kb(m, "SecPageTables:  ",
 		    global_node_page_state(NR_SECONDARY_PAGETABLE));
+#ifdef CONFIG_UKSM
+	show_val_kb(m, "KsmZeroPages:     ",
+		    global_zone_page_state(NR_UKSM_ZERO_PAGES));
+#endif
 
 	show_val_kb(m, "NFS_Unstable:   ", 0);
 	show_val_kb(m, "Bounce:         ",
@@ -162,6 +166,7 @@ static int meminfo_proc_show(struct seq_file *m, void *v)
 		    global_zone_page_state(NR_FREE_CMA_PAGES));
 #endif
 	trace_android_vh_meminfo_proc_show(m);
+	trace_android_rvh_meminfo_proc_show(m);
 
 #ifdef CONFIG_UNACCEPTED_MEMORY
 	show_val_kb(m, "Unaccepted:     ",

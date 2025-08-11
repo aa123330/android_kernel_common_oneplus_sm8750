@@ -23,7 +23,7 @@
 #include <linux/sched_clock.h>
 #include <linux/smp.h>
 #include <linux/nmi.h>
-
+#include <trace/hooks/perf.h>
 #include <asm/arm_pmuv3.h>
 
 /* ARMv8 Cortex-A53 specific event types. */
@@ -751,10 +751,10 @@ static void armv8pmu_start(struct arm_pmu *cpu_pmu)
 	else
 		armv8pmu_disable_user_access();
 
+	kvm_vcpu_pmu_resync_el0();
+
 	/* Enable all counters */
 	armv8pmu_pmcr_write(armv8pmu_pmcr_read() | ARMV8_PMU_PMCR_E);
-
-	kvm_vcpu_pmu_resync_el0();
 }
 
 static void armv8pmu_stop(struct arm_pmu *cpu_pmu)
@@ -809,6 +809,7 @@ static irqreturn_t armv8pmu_handle_irq(struct arm_pmu *cpu_pmu)
 
 		hwc = &event->hw;
 		armpmu_event_update(event);
+		trace_android_rvh_armv8pmu_counter_overflowed(event);
 		perf_sample_data_init(&data, 0, hwc->last_period);
 		if (!armpmu_event_set_period(event))
 			continue;

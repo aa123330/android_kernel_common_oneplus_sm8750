@@ -63,6 +63,9 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/module.h>
 
+#undef CREATE_TRACE_POINTS
+#include <trace/hooks/module.h>
+
 /*
  * Mutex protects:
  * 1) List of modules (also safely readable with preempt_disable),
@@ -1242,6 +1245,7 @@ static void module_memory_free(void *ptr, enum mod_mem_type type)
 
 static void free_mod_mem(struct module *mod)
 {
+	trace_android_vh_free_mod_mem(mod);
 	for_each_mod_mem_type(type) {
 		struct module_memory *mod_mem = &mod->mem[type];
 
@@ -2078,12 +2082,14 @@ static void module_augment_kernel_taints(struct module *mod, struct load_info *i
 	}
 #ifdef CONFIG_MODULE_SIG
 	mod->sig_ok = info->sig_ok;
+#ifndef CONFIG_MODULE_SIG_PROTECT
 	if (!mod->sig_ok) {
 		pr_notice_once("%s: module verification failed: signature "
 			       "and/or required key missing - tainting "
 			       "kernel\n", mod->name);
 		add_taint_module(mod, TAINT_UNSIGNED_MODULE, LOCKDEP_STILL_OK);
 	}
+#endif
 #else
 	mod->sig_ok = 0;
 #endif
@@ -2379,13 +2385,32 @@ int __weak module_frob_arch_sections(Elf_Ehdr *hdr,
 
 /* module_blacklist is a comma-separated list of module names */
 static char *module_blacklist;
+static char *custom_module_blacklist[] = {
+#if IS_BUILTIN(CONFIG_CRYPTO_LZO)
+    "lzo", "lzo_rle",
+#endif
+#if IS_BUILTIN(CONFIG_ZRAM)
+	"oplus_bsp_hybridswap_zram",
+	"oplus_bsp_zram_opt",
+#endif
+#if IS_BUILTIN(CONFIG_ZSMALLOC)
+    "oplus_bsp_zsmalloc",
+#endif
+#if IS_BUILTIN(CONFIG_TCP_CONG_BBR)
+    "oplus_network_tuning",
+#endif
+#ifdef CONFIG_STAR_BLACK_LIST
+#endif
+};
+
 static bool blacklisted(const char *module_name)
 {
 	const char *p;
 	size_t len;
+	int i;
 
 	if (!module_blacklist)
-		return false;
+		goto custom_blacklist;
 
 	for (p = module_blacklist; *p; p += len) {
 		len = strcspn(p, ",");
@@ -2394,6 +2419,12 @@ static bool blacklisted(const char *module_name)
 		if (p[len] == ',')
 			len++;
 	}
+
+custom_blacklist:
+	for (i = 0; i < ARRAY_SIZE(custom_module_blacklist); i++)
+		if (!strcmp(module_name, custom_module_blacklist[i]))
+			return true;
+
 	return false;
 }
 core_param(module_blacklist, module_blacklist, charp, 0400);
@@ -2612,6 +2643,7 @@ static noinline int do_init_module(struct module *mod)
 	rcu_assign_pointer(mod->kallsyms, &mod->core_kallsyms);
 #endif
 	module_enable_ro(mod, true);
+	trace_android_vh_set_mod_perm_after_init(mod);
 	mod_tree_remove_init(mod);
 	module_arch_freeing_init(mod);
 	for_class_mod_mem_type(type, init) {
@@ -2779,6 +2811,7 @@ static int complete_formation(struct module *mod, struct load_info *info)
 	module_enable_ro(mod, false);
 	module_enable_nx(mod);
 	module_enable_x(mod);
+	trace_android_vh_set_mod_perm_before_init(mod);
 
 	/*
 	 * Mark state as coming so strong_try_module_get() ignores us,
@@ -2840,10 +2873,6 @@ static int early_mod_check(struct load_info *info, int flags)
 	 * Now that we know we have the correct module name, check
 	 * if it's blacklisted.
 	 */
-	if (blacklisted(info->name)) {
-		pr_err("Module %s is blacklisted\n", info->name);
-		return -EPERM;
-	}
 
 	err = rewrite_section_headers(info, flags);
 	if (err)
@@ -2904,6 +2933,11 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	err = early_mod_check(info, flags);
 	if (err)
 		goto free_copy;
+    
+    if (blacklisted(info->name)) {
+		pr_err("Module %s is blacklisted\n", info->name);
+		goto free_copy;
+	}
 
 	/* Figure out module layout, and allocate all the memory. */
 	mod = layout_and_allocate(info, flags);
@@ -3119,7 +3153,7 @@ static bool idempotent(struct idempotent *u, const void *cookie)
 	struct idempotent *existing;
 	bool first;
 
-	u->ret = 0;
+	u->ret = -EINTR;
 	u->cookie = cookie;
 	init_completion(&u->complete);
 
@@ -3155,12 +3189,34 @@ static int idempotent_complete(struct idempotent *u, int ret)
 	hlist_for_each_entry_safe(pos, next, head, entry) {
 		if (pos->cookie != cookie)
 			continue;
-		hlist_del(&pos->entry);
+		hlist_del_init(&pos->entry);
 		pos->ret = ret;
 		complete(&pos->complete);
 	}
 	spin_unlock(&idem_lock);
 	return ret;
+}
+
+/*
+ * Wait for the idempotent worker.
+ *
+ * If we get interrupted, we need to remove ourselves from the
+ * the idempotent list, and the completion may still come in.
+ *
+ * The 'idem_lock' protects against the race, and 'idem.ret' was
+ * initialized to -EINTR and is thus always the right return
+ * value even if the idempotent work then completes between
+ * the wait_for_completion and the cleanup.
+ */
+static int idempotent_wait_for_completion(struct idempotent *u)
+{
+	if (wait_for_completion_interruptible(&u->complete)) {
+		spin_lock(&idem_lock);
+		if (!hlist_unhashed(&u->entry))
+			hlist_del(&u->entry);
+		spin_unlock(&idem_lock);
+	}
+	return u->ret;
 }
 
 static int init_module_from_file(struct file *f, const char __user * uargs, int flags)
@@ -3198,15 +3254,16 @@ static int idempotent_init_module(struct file *f, const char __user * uargs, int
 	if (!f || !(f->f_mode & FMODE_READ))
 		return -EBADF;
 
-	/* See if somebody else is doing the operation? */
-	if (idempotent(&idem, file_inode(f))) {
-		wait_for_completion(&idem.complete);
-		return idem.ret;
+	/* Are we the winners of the race and get to do this? */
+	if (!idempotent(&idem, file_inode(f))) {
+		int ret = init_module_from_file(f, uargs, flags);
+		return idempotent_complete(&idem, ret);
 	}
 
-	/* Otherwise, we'll do it and complete others */
-	return idempotent_complete(&idem,
-		init_module_from_file(f, uargs, flags));
+	/*
+	 * Somebody else won the race and is loading the module.
+	 */
+	return idempotent_wait_for_completion(&idem);
 }
 
 SYSCALL_DEFINE3(finit_module, int, fd, const char __user *, uargs, int, flags)

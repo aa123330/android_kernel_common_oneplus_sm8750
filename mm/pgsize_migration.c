@@ -140,7 +140,7 @@ unsigned long vma_pad_pages(struct vm_area_struct *vma)
 	if (!is_pgsize_migration_enabled())
 		return 0;
 
-	return vma->vm_flags >> VM_PAD_SHIFT;
+	return (vma->vm_flags & VM_PAD_MASK) >> VM_PAD_SHIFT;
 }
 
 static __always_inline bool str_has_suffix(const char *str, const char *suffix)
@@ -167,8 +167,6 @@ static __always_inline bool str_has_suffix(const char *str, const char *suffix)
  * VMAs of the current task.
  *
  * Returns true if in linker context, otherwise false.
- *
- * Caller must hold mmap lock in read mode.
  */
 static inline bool linker_ctx(void)
 {
@@ -180,14 +178,14 @@ static inline bool linker_ctx(void)
 	if (!regs)
 		return false;
 
-	vma = find_vma(mm, instruction_pointer(regs));
+	vma = lock_vma_under_rcu(mm, instruction_pointer(regs));
 
 	/* Current execution context, the VMA must be present */
 	BUG_ON(!vma);
 
 	file = vma->vm_file;
 	if (!file)
-		return false;
+		goto out;
 
 	if ((vma->vm_flags & VM_EXEC)) {
 		char buf[64];
@@ -205,10 +203,13 @@ static inline bool linker_ctx(void)
 		 *
 		 * Check the base name (linker64).
 		 */
-		if (!strcmp(kbasename(path), "linker64"))
+		if (!strcmp(kbasename(path), "linker64")) {
+			vma_end_read(vma);
 			return true;
+		}
 	}
-
+out:
+	vma_end_read(vma);
 	return false;
 }
 
@@ -270,18 +271,25 @@ static const struct vm_operations_struct pad_vma_ops = {
 	.name = pad_vma_name,
 };
 
+/* Defined in kernel/fork.c */
+extern struct kmem_cache *vm_area_cachep;
+
 /*
- * Returns a new VMA representing the padding in @vma, if no padding
- * in @vma returns NULL.
+ * Returns a new VMA representing the padding in @vma;
+ * returns NULL if no padding in @vma or allocation failed.
  */
-struct vm_area_struct *get_pad_vma(struct vm_area_struct *vma)
+static struct vm_area_struct *get_pad_vma(struct vm_area_struct *vma)
 {
 	struct vm_area_struct *pad;
 
 	if (!is_pgsize_migration_enabled() || !(vma->vm_flags & VM_PAD_MASK))
 		return NULL;
 
-	pad = kzalloc(sizeof(struct vm_area_struct), GFP_KERNEL);
+	pad = kmem_cache_alloc(vm_area_cachep, GFP_KERNEL);
+	if (!pad) {
+		pr_warn("Page size migration: Failed to allocate padding VMA");
+		return NULL;
+	}
 
 	memcpy(pad, vma, sizeof(struct vm_area_struct));
 
@@ -307,33 +315,13 @@ struct vm_area_struct *get_pad_vma(struct vm_area_struct *vma)
 }
 
 /*
- * Returns a new VMA exclusing the padding from @vma; if no padding in
- * @vma returns @vma.
- */
-struct vm_area_struct *get_data_vma(struct vm_area_struct *vma)
-{
-	struct vm_area_struct *data;
-
-	if (!is_pgsize_migration_enabled() || !(vma->vm_flags & VM_PAD_MASK))
-		return vma;
-
-	data = kzalloc(sizeof(struct vm_area_struct), GFP_KERNEL);
-
-	memcpy(data, vma, sizeof(struct vm_area_struct));
-
-	/* Adjust the end to the start of the padding section */
-	data->vm_end = VMA_PAD_START(data);
-
-	return data;
-}
-
-/*
  * Calls the show_pad_vma_fn on the @pad VMA, and frees the copies of @vma
  * and @pad.
  */
-void show_map_pad_vma(struct vm_area_struct *vma, struct vm_area_struct *pad,
-		      struct seq_file *m, void *func, bool smaps)
+void show_map_pad_vma(struct vm_area_struct *vma, struct seq_file *m,
+		      void *func, bool smaps)
 {
+	struct vm_area_struct *pad = get_pad_vma(vma);
 	if (!pad)
 		return;
 
@@ -349,13 +337,21 @@ void show_map_pad_vma(struct vm_area_struct *vma, struct vm_area_struct *pad,
 	 */
 	BUG_ON(!vma);
 
+	/* The pad VMA should be anonymous. */
+	BUG_ON(pad->vm_file);
+
+	/* The pad VMA should be PROT_NONE. */
+	BUG_ON(pad->vm_flags & (VM_READ|VM_WRITE|VM_EXEC));
+
+	/* The pad VMA itself cannot have padding; infinite recursion */
+	BUG_ON(pad->vm_flags & VM_PAD_MASK);
+
 	if (smaps)
 		((show_pad_smaps_fn)func)(m, pad);
 	else
 		((show_pad_maps_fn)func)(m, pad);
 
-	kfree(pad);
-	kfree(vma);
+	kmem_cache_free(vm_area_cachep, pad);
 }
 
 /*
@@ -413,13 +409,33 @@ void split_pad_vma(struct vm_area_struct *vma, struct vm_area_struct *new,
 
 	nr_vma2_pages = vma_pages(second);
 
-	if (nr_vma2_pages >= nr_pad_pages) { 			/* Case 1 & 3*/
-		vm_flags_clear(first, VM_PAD_MASK);
+	if (nr_vma2_pages >= nr_pad_pages) { 			/* Case 1 & 3 */
+		vma_set_pad_pages(first, 0);
 		vma_set_pad_pages(second, nr_pad_pages);
 	} else {						/* Case 2 */
 		vma_set_pad_pages(first, nr_pad_pages - nr_vma2_pages);
 		vma_set_pad_pages(second, nr_vma2_pages);
 	}
 }
+
+/*
+ * Merging of padding VMAs is uncommon, as padding is only allowed
+ * from the linker context.
+ *
+ * To simplify the semantics, adjacent VMAs with padding are not
+ * allowed to merge.
+ */
+bool is_mergable_pad_vma(struct vm_area_struct *vma,
+			 unsigned long vm_flags)
+{
+	/* Padding VMAs cannot be merged with other padding or real VMAs */
+	return !((vma->vm_flags | vm_flags) & VM_PAD_MASK);
+}
+
+unsigned long vma_data_pages(struct vm_area_struct *vma)
+{
+	return vma_pages(vma) - vma_pad_pages(vma);
+}
+
 #endif /* PAGE_SIZE == SZ_4K */
 #endif /* CONFIG_64BIT */

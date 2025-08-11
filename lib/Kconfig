@@ -2,7 +2,7 @@
 #
 # Library configuration
 #
-
+source "lib/lz4k_oplus/Kconfig"
 config BINARY_PRINTF
 	def_bool n
 
@@ -341,6 +341,18 @@ config LZ4HC_COMPRESS
 
 config LZ4_DECOMPRESS
 	tristate
+	
+config LZ4K_COMPRESS
+	tristate
+
+config LZ4K_DECOMPRESS
+	tristate
+
+config LZ4KD_COMPRESS
+	tristate
+
+config LZ4KD_DECOMPRESS
+ 	tristate
 
 config ZSTD_COMMON
 	select XXHASH
@@ -539,13 +551,7 @@ config CPUMASK_OFFSTACK
 	  stack overflow.
 
 config FORCE_NR_CPUS
-       bool "Set number of CPUs at compile time"
-       depends on SMP && EXPERT && !COMPILE_TEST
-       help
-         Say Yes if you have NR_CPUS set to an actual number of possible
-         CPUs in your system, not to a default value. This forces the core
-         code to rely on compile-time value and optimize kernel routines
-         better.
+	def_bool !SMP
 
 config CPU_RMAP
 	bool
@@ -757,6 +763,7 @@ config GENERIC_LIB_DEVMEM_IS_ALLOWED
 
 config PLDMFW
 	bool
+	select CRC32
 	default n
 
 config ASN1_ENCODER

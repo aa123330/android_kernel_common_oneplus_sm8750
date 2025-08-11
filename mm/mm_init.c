@@ -27,6 +27,7 @@
 #include <linux/swap.h>
 #include <linux/cma.h>
 #include <linux/crash_dump.h>
+#include <linux/kfifo.h>
 #include "internal.h"
 #include "slab.h"
 #include "shuffle.h"
@@ -1458,6 +1459,9 @@ static void __meminit pgdat_init_internals(struct pglist_data *pgdat)
 	pgdat_init_kcompactd(pgdat);
 
 	init_waitqueue_head(&pgdat->kswapd_wait);
+
+	/* kcompress will be initialized later in kswapd_run() */
+	pgdat->kcompress = NULL;
 	init_waitqueue_head(&pgdat->pfmemalloc_wait);
 
 	for (i = 0; i < NR_VMSCAN_THROTTLE; i++)
@@ -1558,7 +1562,7 @@ static inline void setup_usemap(struct zone *zone) {}
 /* Initialise the number of pages represented by NR_PAGEBLOCK_BITS */
 void __init set_pageblock_order(void)
 {
-	unsigned int order = MAX_ORDER;
+	unsigned int order = PAGE_BLOCK_ORDER;
 
 	/* Check that pageblock_nr_pages has not already been setup */
 	if (pageblock_order)
@@ -1723,8 +1727,10 @@ void __init *memmap_alloc(phys_addr_t size, phys_addr_t align,
 						 MEMBLOCK_ALLOC_ACCESSIBLE,
 						 nid);
 
-	if (ptr && size > 0)
+	if (ptr && size > 0) {
 		page_init_poison(ptr, size);
+		memblock_memsize_mod_memmap_size((long)size);
+	}
 
 	return ptr;
 }
@@ -2818,6 +2824,8 @@ static void __init mem_init_print_info(void)
 	init_data_size = __init_end - __init_begin;
 	init_code_size = _einittext - _sinittext;
 
+	memblock_memsize_kernel_code_data(codesize, datasize, rosize, bss_size);
+
 	/*
 	 * Detect special cases and adjust section sizes accordingly:
 	 * 1) .init.* may be embedded into .data sections
@@ -2854,6 +2862,7 @@ static void __init mem_init_print_info(void)
 		, K(totalhigh_pages())
 #endif
 		);
+	printk(KERN_INFO "le9 Unofficial (le9uo) working set protection 1.14a by Masahito Suzuki (forked from hakavlad's original le9 patch)");
 }
 
 /*

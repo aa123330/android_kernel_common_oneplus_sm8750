@@ -585,7 +585,8 @@ bool pm_debug_messages_on __read_mostly;
 
 bool pm_debug_messages_should_print(void)
 {
-	return pm_debug_messages_on && pm_suspend_target_state != PM_SUSPEND_ON;
+	return pm_debug_messages_on && (hibernation_in_progress() ||
+		pm_suspend_target_state != PM_SUSPEND_ON);
 }
 EXPORT_SYMBOL_GPL(pm_debug_messages_should_print);
 
@@ -920,6 +921,9 @@ static ssize_t pm_freeze_timeout_store(struct kobject *kobj,
 				       const char *buf, size_t n)
 {
 	unsigned long val;
+
+	/* Don't let anything in Android change the freeze timeout */
+	return n;
 
 	if (kstrtoul(buf, 10, &val))
 		return -EINVAL;

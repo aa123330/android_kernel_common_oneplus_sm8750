@@ -63,6 +63,7 @@
 #include <linux/mount.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/pid.h>
+#include <linux/kcompress.h>
 
 #include "../lib/kstrtox.h"
 
@@ -1710,9 +1711,9 @@ static struct ctl_table kern_table[] = {
 	{
 		.procname	= "ftrace_dump_on_oops",
 		.data		= &ftrace_dump_on_oops,
-		.maxlen		= sizeof(int),
+		.maxlen		= MAX_TRACER_SIZE,
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
+		.proc_handler	= proc_dostring,
 	},
 	{
 		.procname	= "traceoff_on_warning",
@@ -2046,6 +2047,9 @@ static struct ctl_table kern_table[] = {
 	{ }
 };
 
+int vm_kcompressd = 24;
+static int SYSCTL_KCOMPRESS_FIFO_SIZE = KCOMPRESS_FIFO_SIZE;
+
 static struct ctl_table vm_table[] = {
 	{
 		.procname	= "overcommit_memory",
@@ -2095,6 +2099,15 @@ static struct ctl_table vm_table[] = {
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= SYSCTL_TWO_HUNDRED,
+	},
+	{
+		.procname	= "kcompressd",
+		.data		= &vm_kcompressd,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler = proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= &SYSCTL_KCOMPRESS_FIFO_SIZE,
 	},
 #ifdef CONFIG_NUMA
 	{
@@ -2213,6 +2226,40 @@ static struct ctl_table vm_table[] = {
 		.extra1		= SYSCTL_ZERO,
 	},
 #endif
+	{
+		.procname	= "workingset_protection",
+		.data		= &sysctl_workingset_protection,
+		.maxlen		= sizeof(bool),
+		.mode		= 0644,
+		.proc_handler	= &proc_dobool,
+	},
+	{
+		.procname	= "anon_min_ratio",
+		.data		= &sysctl_anon_min_ratio,
+		.maxlen		= sizeof(u8),
+		.mode		= 0644,
+		.proc_handler	= &vm_workingset_protection_update_handler,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE_HUNDRED,
+	},
+	{
+		.procname	= "clean_low_ratio",
+		.data		= &sysctl_clean_low_ratio,
+		.maxlen		= sizeof(u8),
+		.mode		= 0644,
+		.proc_handler	= &vm_workingset_protection_update_handler,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE_HUNDRED,
+	},
+	{
+		.procname	= "clean_min_ratio",
+		.data		= &sysctl_clean_min_ratio,
+		.maxlen		= sizeof(u8),
+		.mode		= 0644,
+		.proc_handler	= &vm_workingset_protection_update_handler,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE_HUNDRED,
+	},
 	{
 		.procname	= "user_reserve_kbytes",
 		.data		= &sysctl_user_reserve_kbytes,

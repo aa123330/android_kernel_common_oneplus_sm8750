@@ -532,6 +532,10 @@ struct sched_statistics {
 #endif /* CONFIG_SCHEDSTATS */
 } ____cacheline_aligned;
 
+#ifdef CONFIG_SCHED_BORE
+struct sched_bore_stats;
+#endif // CONFIG_SCHED_BORE
+
 struct sched_entity {
 	/* For load-balancing: */
 	struct load_weight		load;
@@ -571,8 +575,11 @@ struct sched_entity {
 	 */
 	struct sched_avg		avg;
 #endif
-
+#ifdef CONFIG_SCHED_BORE
+	ANDROID_KABI_USE(1, struct sched_bore_stats *bore_stats);
+#else // !CONFIG_SCHED_BORE
 	ANDROID_KABI_RESERVE(1);
+#endif // CONFIG_SCHED_BORE
 	ANDROID_KABI_RESERVE(2);
 	ANDROID_KABI_RESERVE(3);
 	ANDROID_KABI_RESERVE(4);
@@ -736,6 +743,20 @@ struct kmap_ctrl {
 	pte_t				pteval[KM_MAX_IDX];
 #endif
 };
+
+#ifdef CONFIG_QOS_CTRL
+struct qos_task_struct {
+	/*
+	 * 'in_qos' marks the qos level o current task, greater value for
+	 * greater qos, range from (NO_QOS, NR_QOS)
+	 *
+	 *
+	 * 'qos_list' use to track task with qos supply in auth_struct
+	 */
+	int                 in_qos;
+	struct list_head    qos_list;
+};
+#endif
 
 struct task_struct {
 #ifdef CONFIG_THREAD_INFO_IN_TASK
@@ -1530,7 +1551,11 @@ struct task_struct {
 	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);
 #endif
+#ifdef CONFIG_QOS_CTRL
+	ANDROID_KABI_USE(3,struct qos_task_struct *qts);
+#else
 	ANDROID_KABI_RESERVE(3);
+#endif
 	ANDROID_KABI_RESERVE(4);
 	ANDROID_KABI_RESERVE(5);
 	ANDROID_KABI_RESERVE(6);
@@ -1693,8 +1718,9 @@ static inline unsigned int __task_state_index(unsigned int tsk_state,
 	 * We're lying here, but rather than expose a completely new task state
 	 * to userspace, we can make this appear as if the task has gone through
 	 * a regular rt_mutex_lock() call.
+	 * Report frozen tasks as uninterruptible.
 	 */
-	if (tsk_state & TASK_RTLOCK_WAIT)
+	if ((tsk_state & TASK_RTLOCK_WAIT) || (tsk_state & TASK_FROZEN))
 		state = TASK_UNINTERRUPTIBLE;
 
 	return fls(state);
@@ -1754,7 +1780,7 @@ extern struct pid *cad_pid;
 #define PF_USED_MATH		0x00002000	/* If unset the fpu must be initialized before use */
 #define PF_USER_WORKER		0x00004000	/* Kernel thread cloned from userspace thread */
 #define PF_NOFREEZE		0x00008000	/* This thread should not be frozen */
-#define PF__HOLE__00010000	0x00010000
+#define PF_KCOMPACTD		0x00010000	/* I am kcompactd */
 #define PF_KSWAPD		0x00020000	/* I am kswapd */
 #define PF_MEMALLOC_NOFS	0x00040000	/* All allocation requests will inherit GFP_NOFS */
 #define PF_MEMALLOC_NOIO	0x00080000	/* All allocation requests will inherit GFP_NOIO */
@@ -1931,6 +1957,7 @@ static inline int task_nice(const struct task_struct *p)
 {
 	return PRIO_TO_NICE((p)->static_prio);
 }
+
 
 extern int can_nice(const struct task_struct *p, const int nice);
 extern int task_curr(const struct task_struct *p);

@@ -106,6 +106,8 @@ struct ksmbd_conn {
 	bool				signing_negotiated;
 	__le16				signing_algorithm;
 	bool				binding;
+	atomic_t			refcnt;
+	bool				is_aapl;
 };
 
 struct ksmbd_conn_ops {
@@ -145,7 +147,8 @@ extern struct list_head conn_list;
 extern struct rw_semaphore conn_list_lock;
 
 bool ksmbd_conn_alive(struct ksmbd_conn *conn);
-void ksmbd_conn_wait_idle(struct ksmbd_conn *conn, u64 sess_id);
+void ksmbd_conn_wait_idle(struct ksmbd_conn *conn);
+int ksmbd_conn_wait_idle_sess_id(struct ksmbd_conn *curr_conn, u64 sess_id);
 struct ksmbd_conn *ksmbd_conn_alloc(void);
 void ksmbd_conn_free(struct ksmbd_conn *conn);
 bool ksmbd_conn_lookup_dialect(struct ksmbd_conn *c);
@@ -166,6 +169,8 @@ int ksmbd_conn_transport_init(void);
 void ksmbd_conn_transport_destroy(void);
 void ksmbd_conn_lock(struct ksmbd_conn *conn);
 void ksmbd_conn_unlock(struct ksmbd_conn *conn);
+void ksmbd_conn_r_count_inc(struct ksmbd_conn *conn);
+void ksmbd_conn_r_count_dec(struct ksmbd_conn *conn);
 
 /*
  * WARNING
