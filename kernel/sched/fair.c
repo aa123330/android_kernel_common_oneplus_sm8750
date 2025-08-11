@@ -970,7 +970,7 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
 	 */
 	if (sched_feat(RUN_TO_PARITY) && curr && curr->vlag == curr->deadline)
 #ifdef CONFIG_SCHED_BORE
-		if (unlikely(!sched_bore) || !curr->bore_stats || !curr->bore_stats->is_waiting_for_lock)
+		if (!curr->bore_stats || !curr->bore_stats->waiting_for_futex || unlikely(!sched_bore))
 #endif // CONFIG_SCHED_BORE
 		return curr;
 

@@ -13,7 +13,7 @@ u8   __read_mostly sched_burst_exclude_kthreads = 1;
 u8   __read_mostly sched_burst_smoothness       = 40;
 u8   __read_mostly sched_burst_fork_atavistic   = 1;
 u8   __read_mostly sched_burst_penalty_offset   = 24;
-u8   __read_mostly sched_burst_futex_boost      = 12;
+u8   __read_mostly sched_burst_futex_boost      = 10;
 uint __read_mostly sched_burst_penalty_scale    = 3180;
 uint __read_mostly sched_burst_cache_stop_count = 64;
 uint __read_mostly sched_burst_cache_lifetime   = 75000000;
@@ -63,7 +63,7 @@ inline u8 effective_prio_bore(struct task_struct *p) {
 	int prio = p->static_prio - MAX_RT_PRIO;
 	if (likely(sched_bore)) {
 		prio += p->se.bore_stats->burst_score;
-		if (p->se.bore_stats->is_waiting_for_lock)
+		if (p->se.bore_stats->waiting_for_futex)
 			prio -= sched_burst_futex_boost;
 	}
 	return (u8)clamp(prio, 0, maxval_prio);

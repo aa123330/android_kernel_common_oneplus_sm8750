@@ -360,8 +360,19 @@ void futex_wait_queue(struct futex_hash_bucket *hb, struct futex_q *q,
 		 * is no timeout, or if it has yet to expire.
 		 */
 		if (!timeout || timeout->task) {
+#ifdef CONFIG_SCHED_BORE
+			bool boost = likely(sched_bore && sched_burst_futex_boost);
+			current->se.bore_stats->waiting_for_futex = true;
+			if (boost)
+				set_load_weight_rq_lock(current, true);
+#endif // CONFIG_SCHED_BORE
 			trace_android_vh_futex_sleep_start(current);
 			schedule();
+#ifdef CONFIG_SCHED_BORE
+			current->se.bore_stats->waiting_for_futex = false;
+			if (boost)
+				set_load_weight_rq_lock(current, true);
+#endif // CONFIG_SCHED_BORE
 		}
 	}
 	__set_current_state(TASK_RUNNING);
@@ -663,22 +674,9 @@ retry:
 	if (ret)
 		goto out;
 
-#ifdef CONFIG_SCHED_BORE
-	bool boost = likely(sched_bore && sched_burst_futex_boost);
-	current->se.bore_stats->is_waiting_for_lock = true;
-	if (boost)
-		set_load_weight_rq_lock(current, true);
-#endif // CONFIG_SCHED_BORE
-
 	trace_android_vh_futex_wait_queue_start(uaddr, flags, bitset);
 	/* futex_queue and wait for wakeup, timeout, or a signal. */
 	futex_wait_queue(hb, &q, to);
-
-#ifdef CONFIG_SCHED_BORE
-	current->se.bore_stats->is_waiting_for_lock = false;
-	if (boost)
-		set_load_weight_rq_lock(current, true);
-#endif // CONFIG_SCHED_BORE
 
 	/* If we were woken (and unqueued), we succeeded, whatever. */
 	ret = 0;
