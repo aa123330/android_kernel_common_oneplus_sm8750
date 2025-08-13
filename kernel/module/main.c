@@ -2401,6 +2401,9 @@ static char *custom_module_blacklist[] = {
 #endif
 #ifdef CONFIG_STAR_BLACK_LIST
 #endif
+//thermal module_blacklist
+	"thermal_pa_adc",
+	"horae_shell_temp",
 };
 
 static bool blacklisted(const char *module_name)
