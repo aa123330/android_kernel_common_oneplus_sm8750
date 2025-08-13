@@ -1276,6 +1276,7 @@ int power_supply_get_property(struct power_supply *psy,
 			    enum power_supply_property psp,
 			    union power_supply_propval *val)
 {
+	int ret; //Declare a variable to receive the return value
 	if (atomic_read(&psy->use_cnt) <= 0) {
 		if (!psy->initialized)
 			return -EAGAIN;
@@ -1283,11 +1284,19 @@ int power_supply_get_property(struct power_supply *psy,
 	}
 
 	if (psy_has_property(psy->desc, psp))
-		return psy->desc->get_property(psy, psp, val);
+		ret = psy->desc->get_property(psy, psp, val); // Store the return value in ret
 	else if (power_supply_battery_info_has_prop(psy->battery_info, psp))
-		return power_supply_battery_info_get_prop(psy->battery_info, psp, val);
+		ret = power_supply_battery_info_get_prop(psy->battery_info, psp, val);
 	else
 		return -EINVAL;
+
+/* Global change: Lower reported battery temperature at the data sourc */
+    if (ret == 0 && psp == POWER_SUPPLY_PROP_TEMP){
+        val->intval -= 80;
+	}
+
+	return ret;
+
 }
 EXPORT_SYMBOL_GPL(power_supply_get_property);
 
