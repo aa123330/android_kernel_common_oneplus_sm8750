@@ -14,7 +14,6 @@ u8   __read_mostly sched_burst_smoothness       = 40;
 u8   __read_mostly sched_burst_fork_atavistic   = 2;
 u8   __read_mostly sched_burst_parity_threshold = 2;
 u8   __read_mostly sched_burst_penalty_offset   = 24;
-u8   __read_mostly sched_futex_boost            = 5;
 uint __read_mostly sched_burst_penalty_scale    = 3180;
 uint __read_mostly sched_burst_cache_stop_count = 64;
 uint __read_mostly sched_burst_cache_lifetime   = 75000000;
@@ -59,7 +58,7 @@ static void reweight_task_by_prio(struct task_struct *p, int prio) {
 	se->load.inv_weight = sched_prio_to_wmult[prio];
 }
 
-inline u8 effective_prio_bore(struct task_struct *p) {
+static inline u8 effective_prio(struct task_struct *p) {
 	u8 prio = p->static_prio - MAX_RT_PRIO;
 	if (likely(sched_bore))
 		prio += p->se.bore_stats->burst_score;
@@ -69,14 +68,14 @@ inline u8 effective_prio_bore(struct task_struct *p) {
 void update_burst_score(struct sched_entity *se) {
 	if (!entity_is_task(se)) return;
 	struct task_struct *p = task_of(se);
-	u8 prev_prio = effective_prio_bore(p);
+	u8 prev_prio = effective_prio(p);
 
 	u8 burst_score = 0;
 	if (!((p->flags & PF_KTHREAD) && likely(sched_burst_exclude_kthreads)))
 		burst_score = se->bore_stats->burst_penalty >> BURST_PENALTY_SHIFT;
 	se->bore_stats->burst_score = burst_score;
 
-	u8 new_prio = effective_prio_bore(p);
+	u8 new_prio = effective_prio(p);
 	if (new_prio != prev_prio)
 		reweight_task_by_prio(p, new_prio);
 }
@@ -92,9 +91,9 @@ void update_curr_bore(u64 delta_exec, struct sched_entity *se) {
 	update_burst_score(se);
 }
 
-static inline u32 binary_smooth(u32 new, u32 old, u8 damper) {
+static inline u32 binary_smooth(u32 new, u32 old, u8 dumper) {
 	u32 abs_diff = (new > old)? (new - old): (old - new);
-	u32 adj_diff = (abs_diff / damper) + ((abs_diff % damper) != 0);
+	u32 adj_diff = (abs_diff / dumper) + ((abs_diff % dumper) != 0);
 	return (new > old)? (old + adj_diff): (old - adj_diff);
 }
 
@@ -120,9 +119,9 @@ inline void restart_burst(struct sched_entity *se) {
 void restart_burst_rescale_deadline(struct sched_entity *se) {
 	s64 vscaled, wremain, vremain = se->deadline - se->vruntime;
 	struct task_struct *p = task_of(se);
-	u8 prev_prio = effective_prio_bore(p);
+	u8 prev_prio = effective_prio(p);
 	restart_burst(se);
-	u8 new_prio = effective_prio_bore(p);
+	u8 new_prio = effective_prio(p);
 	if (prev_prio > new_prio) {
 		wremain = __unscale_slice(abs(vremain), prev_prio);
 		vscaled = __scale_slice(wremain, new_prio);
@@ -146,7 +145,7 @@ static inline void reset_task_weights_bore(void) {
 		rq = task_rq(task);
 		rq_pin_lock(rq, &rf);
 		update_rq_clock(rq);
-		reweight_task_by_prio(task, effective_prio_bore(task));
+		reweight_task_by_prio(task, effective_prio(task));
 		rq_unpin_lock(rq, &rf);
 	}
 	write_unlock_irq(&tasklist_lock);
@@ -388,13 +387,6 @@ static struct ctl_table sched_bore_sysctls[] = {
 		.proc_handler = proc_dou8vec_minmax,
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= &maxval_6_bits,
-	},
-	{
-		.procname	= "sched_futex_boost",
-		.data		= &sched_futex_boost,
-		.maxlen		= sizeof(u8),
-		.mode		= 0644,
-		.proc_handler = proc_dou8vec_minmax,
 	},
 	{
 		.procname	= "sched_burst_penalty_scale",
