@@ -7,7 +7,7 @@
 #define SCHED_BORE_AUTHOR   "Masahito Suzuki"
 #define SCHED_BORE_PROGNAME "BORE CPU Scheduler modification"
 
-#define SCHED_BORE_VERSION  "6.2.4"
+#define SCHED_BORE_VERSION  "6.2.3"
 
 #ifdef CONFIG_SCHED_BORE
 extern u8   __read_mostly sched_bore;
@@ -54,7 +54,7 @@ struct sched_bore_stats  {
 	u32				burst_penalty;
 	u8				burst_score;
 	u8				burst_count;
-	bool			waiting_for_futex;
+	bool			is_waiting_for_lock;
 	struct sched_burst_cache child_burst;
 	struct sched_burst_cache group_burst;
 };
