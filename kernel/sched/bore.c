@@ -154,10 +154,11 @@ static inline void reset_task_weights_bore(void) {
 	write_lock_irq(&tasklist_lock);
 	for_each_process(task) {
 		if (!task_is_bore_eligible(task)) continue;
-		rq = task_rq_lock(task, &rf);
+		rq = task_rq(task);
+		rq_pin_lock(rq, &rf);
 		update_rq_clock(rq);
 		reweight_task_by_prio(task, effective_prio_bore(task));
-		task_rq_unlock(rq, task, &rf);
+		rq_unpin_lock(rq, &rf);
 	}
 	write_unlock_irq(&tasklist_lock);
 }
