@@ -12,8 +12,9 @@ u8   __read_mostly sched_bore                   = 1;
 u8   __read_mostly sched_burst_exclude_kthreads = 1;
 u8   __read_mostly sched_burst_smoothness       = 40;
 u8   __read_mostly sched_burst_fork_atavistic   = 1;
+u8   __read_mostly sched_burst_parity_threshold = 2;
 u8   __read_mostly sched_burst_penalty_offset   = 24;
-u8   __read_mostly sched_burst_futex_boost      = 12;
+u8   __read_mostly sched_burst_futex_boost      = 15;
 uint __read_mostly sched_burst_penalty_scale    = 3180;
 uint __read_mostly sched_burst_cache_stop_count = 64;
 uint __read_mostly sched_burst_cache_lifetime   = 75000000;
@@ -379,6 +380,15 @@ static struct ctl_table sched_bore_sysctls[] = {
 		.proc_handler = proc_dou8vec_minmax,
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= SYSCTL_THREE,
+	},
+	{
+		.procname	= "sched_burst_parity_threshold",
+		.data		= &sched_burst_parity_threshold,
+		.maxlen		= sizeof(u8),
+		.mode		= 0644,
+		.proc_handler = proc_dou8vec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= &maxval_8_bits,
 	},
 	{
 		.procname	= "sched_burst_penalty_offset",
