@@ -23,6 +23,7 @@
 #include <linux/page-flags.h>
 #include <linux/local_lock.h>
 #include <linux/android_kabi.h>
+#include <linux/zswap.h>
 #include <linux/kcompress.h>
 #include <asm/page.h>
 
